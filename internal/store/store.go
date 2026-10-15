@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -27,6 +26,7 @@ const (
 	indexFileName      = "index.json"
 	sessionsDirName    = "sessions"
 	scrollbackDir      = "scrollback"
+	generationLockName = ".index.lock"
 	defaultDirPerm     = 0o755
 	defaultFilePerm    = 0o644
 	scrollbackDirPerm  = 0o700
@@ -34,19 +34,13 @@ const (
 )
 
 type Store struct {
-	baseDir     string
-	indexMu     sync.Mutex
-	sessionsMu  sync.Mutex
-	sessionLock map[string]*sync.Mutex
+	baseDir string
+	// genHook is used by internal tests to inject failures and crash points.
+	genHook *generationHooks
 }
 
 func New(baseDir string) *Store {
-	return &Store{
-		baseDir:     baseDir,
-		indexMu:     sync.Mutex{},
-		sessionsMu:  sync.Mutex{},
-		sessionLock: make(map[string]*sync.Mutex),
-	}
+	return &Store{baseDir: baseDir}
 }
 
 func DefaultDataDir() string {
@@ -62,22 +56,15 @@ func DefaultDataDir() string {
 	return filepath.Join(home, ".local", "share", "lazy-tmux")
 }
 
+// SaveSession publishes one generation covering a single session. Manual saves
+// take the same generation boundary as background batches, so they can never
+// expose a mixed generation and never affect other sessions.
 func (s *Store) SaveSession(sessionSnapshot snapshot.SessionSnapshot) error {
 	if sessionSnapshot.SessionName == "" {
 		return errEmptySessionName
 	}
 
-	if sessionSnapshot.CapturedAt.IsZero() {
-		sessionSnapshot.CapturedAt = time.Now().UTC()
-	}
-
-	unlock, err := s.lockSessionMutation(sessionSnapshot.SessionName)
-	if err != nil {
-		return err
-	}
-	defer unlock()
-
-	return s.saveSessionUnlocked(sessionSnapshot)
+	return s.SaveSessions([]snapshot.SessionSnapshot{sessionSnapshot})
 }
 
 func (s *Store) DeleteSession(name string) error {
@@ -86,59 +73,40 @@ func (s *Store) DeleteSession(name string) error {
 		return errEmptySessionName
 	}
 
-	unlock, err := s.lockSessionMutation(name)
-	if err != nil {
-		return err
-	}
-	defer unlock()
-
-	path := s.sessionPath(name)
-
-	err = os.Remove(path)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove session file: %w", err)
-	}
-
-	safeName, err := safeScrollbackSessionName(name)
-	if err != nil {
-		return err
-	}
-
-	scrollRoot := filepath.Clean(filepath.Join(s.baseDir, scrollbackDir))
-	sessionDir := filepath.Clean(filepath.Join(scrollRoot, safeName))
-
-	err = ensureUnderDir(scrollRoot, sessionDir, name)
-	if err != nil {
-		return err
-	}
-
-	err = os.RemoveAll(sessionDir)
-	if err != nil {
-		return fmt.Errorf("remove scrollback dir: %w", err)
-	}
-
-	return s.withIndexLock(func() error {
-		idx, err := s.loadIndexUnlocked()
+	return s.withGenerationLock(syscall.LOCK_EX, func() error {
+		err := s.recoverGenerationsLocked()
 		if err != nil {
 			return err
 		}
 
-		if idx.Sessions != nil {
-			delete(idx.Sessions, name)
-		}
-
-		idx.Updated = time.Now().UTC()
-
-		return writeJSONAtomic(s.indexPath(), idx)
+		return s.deleteSessionUnlocked(name)
 	})
 }
 
 func (s *Store) LoadSession(name string) (snapshot.SessionSnapshot, error) {
-	return s.loadSession(name, true)
+	var out snapshot.SessionSnapshot
+
+	err := s.withGenerationLock(syscall.LOCK_SH, func() error {
+		loaded, loadErr := s.loadSessionUnlocked(name, true)
+		out = loaded
+
+		return loadErr
+	})
+
+	return out, err
 }
 
 func (s *Store) LoadSessionMetadata(name string) (snapshot.SessionSnapshot, error) {
-	return s.loadSession(name, false)
+	var out snapshot.SessionSnapshot
+
+	err := s.withGenerationLock(syscall.LOCK_SH, func() error {
+		loaded, loadErr := s.loadSessionUnlocked(name, false)
+		out = loaded
+
+		return loadErr
+	})
+
+	return out, err
 }
 
 func (s *Store) SessionPath(name string) (string, error) {
@@ -156,36 +124,46 @@ func (s *Store) SessionExists(name string) (bool, error) {
 		return false, errEmptySessionName
 	}
 
-	unlock := s.lockSession(name)
-	defer unlock()
+	exists := false
 
-	path := s.sessionPath(name)
+	err := s.withGenerationLock(syscall.LOCK_SH, func() error {
+		path := s.sessionPath(name)
 
-	_, err := os.Stat(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
+		_, statErr := os.Stat(path)
+		if statErr != nil {
+			if errors.Is(statErr, os.ErrNotExist) {
+				return nil
+			}
+
+			return fmt.Errorf("stat session file: %w", statErr)
 		}
 
-		return false, fmt.Errorf("stat session file: %w", err)
-	}
+		exists = true
 
-	return true, nil
+		return nil
+	})
+
+	return exists, err
 }
 
 func (s *Store) ListRecords() ([]snapshot.Record, error) {
-	idx, err := s.loadIndexUnlocked()
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
+	var records []snapshot.Record
+
+	err := s.withGenerationLock(syscall.LOCK_SH, func() error {
+		idx, loadErr := s.loadIndexUnlocked()
+		if loadErr != nil {
+			return loadErr
 		}
 
-		return nil, err
-	}
+		records = make([]snapshot.Record, 0, len(idx.Sessions))
+		for _, r := range idx.Sessions {
+			records = append(records, r)
+		}
 
-	records := make([]snapshot.Record, 0, len(idx.Sessions))
-	for _, r := range idx.Sessions {
-		records = append(records, r)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	sort.Slice(records, func(i, j int) bool {
@@ -244,14 +222,20 @@ func (s *Store) IndexEntryExists(name string) (bool, error) {
 		return false, errEmptySessionName
 	}
 
-	idx, err := s.loadIndexUnlocked()
-	if err != nil {
-		return false, err
-	}
+	exists := false
 
-	_, ok := idx.Sessions[name]
+	err := s.withGenerationLock(syscall.LOCK_SH, func() error {
+		idx, loadErr := s.loadIndexUnlocked()
+		if loadErr != nil {
+			return loadErr
+		}
 
-	return ok, nil
+		_, exists = idx.Sessions[name]
+
+		return nil
+	})
+
+	return exists, err
 }
 
 func (s *Store) MarkSessionAccessed(name string, accessTime time.Time) error {
@@ -264,7 +248,12 @@ func (s *Store) MarkSessionAccessed(name string, accessTime time.Time) error {
 		accessTime = time.Now().UTC()
 	}
 
-	return s.withIndexLock(func() error {
+	return s.withGenerationLock(syscall.LOCK_EX, func() error {
+		err := s.recoverGenerationsLocked()
+		if err != nil {
+			return err
+		}
+
 		idx, err := s.loadIndexUnlocked()
 		if err != nil {
 			return err
@@ -283,101 +272,74 @@ func (s *Store) MarkSessionAccessed(name string, accessTime time.Time) error {
 	})
 }
 
-func (s *Store) lockSession(name string) func() {
-	s.sessionsMu.Lock()
-	lock, ok := s.sessionLock[name]
-	if !ok {
-		lock = &sync.Mutex{}
-		s.sessionLock[name] = lock
-	}
-	s.sessionsMu.Unlock()
-
-	lock.Lock()
-
-	return lock.Unlock
-}
-
-func (s *Store) lockSessionMutation(name string) (func(), error) {
-	unlockLocal := s.lockSession(name)
-
-	safeName, err := safeScrollbackSessionName(name)
-	if err != nil {
-		unlockLocal()
-
-		return nil, err
-	}
-	lockDir := filepath.Join(s.baseDir, ".session-locks")
-	err = os.MkdirAll(lockDir, 0o700)
-	if err != nil {
-		unlockLocal()
-
-		return nil, fmt.Errorf("create session lock dir: %w", err)
-	}
-	lockPath := filepath.Join(lockDir, safeName+".lock")
-	file, err := os.OpenFile( // #nosec G304 -- sanitized lock name under configured data directory
-		lockPath,
-		os.O_CREATE|os.O_RDWR,
-		0o600,
-	)
-	if err != nil {
-		unlockLocal()
-
-		return nil, fmt.Errorf("open session lock: %w", err)
-	}
-	err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX)
-	if err != nil {
-		_ = file.Close()
-		unlockLocal()
-
-		return nil, fmt.Errorf("lock session: %w", err)
-	}
-
-	return func() {
-		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
-		_ = file.Close()
-		unlockLocal()
-	}, nil
-}
-
-func (s *Store) withIndexLock(run func() error) error {
-	s.indexMu.Lock()
-	defer s.indexMu.Unlock()
-
+// withGenerationLock serializes snapshot generations. Publishers take an
+// exclusive lock; readers (index list, session load) take a shared lock so a
+// generation never exposes a mix of pre- and post-publish artifacts. Locks are
+// per open file description, so separate fds contend even inside one process.
+func (s *Store) withGenerationLock(how int, run func() error) error {
 	err := os.MkdirAll(s.baseDir, defaultDirPerm)
 	if err != nil {
 		return fmt.Errorf("create data dir: %w", err)
 	}
 
-	lockPath := filepath.Join(s.baseDir, ".index.lock")
-	file, err := os.OpenFile( // #nosec G304 -- fixed lock name under the configured data directory
-		lockPath,
-		os.O_CREATE|os.O_RDWR,
-		0o600,
-	)
+	lockPath := filepath.Join(s.baseDir, generationLockName)
+
+	// #nosec G304 -- fixed lock name under the configured data directory
+	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		return fmt.Errorf("open index lock: %w", err)
+		return fmt.Errorf("open generation lock: %w", err)
 	}
+
 	defer func() { _ = file.Close() }()
 
-	err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX)
+	err = syscall.Flock(int(file.Fd()), how)
 	if err != nil {
-		return fmt.Errorf("lock index: %w", err)
+		return fmt.Errorf("acquire generation lock: %w", err)
 	}
+
 	defer func() { _ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN) }()
 
 	return run()
 }
 
-func (s *Store) loadSession(name string, hydrate bool) (snapshot.SessionSnapshot, error) {
-	var out snapshot.SessionSnapshot
+func (s *Store) deleteSessionUnlocked(name string) error {
+	path := s.sessionPath(name)
 
-	unlock, err := s.lockSessionMutation(name)
-	if err != nil {
-		return out, err
+	err := os.Remove(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove session file: %w", err)
 	}
-	defer unlock()
 
-	return s.loadSessionUnlocked(name, hydrate)
+	safeName, err := safeScrollbackSessionName(name)
+	if err != nil {
+		return err
+	}
+
+	scrollRoot := filepath.Clean(filepath.Join(s.baseDir, scrollbackDir))
+	sessionDir := filepath.Clean(filepath.Join(scrollRoot, safeName))
+
+	err = ensureUnderDir(scrollRoot, sessionDir, name)
+	if err != nil {
+		return err
+	}
+
+	err = os.RemoveAll(sessionDir)
+	if err != nil {
+		return fmt.Errorf("remove scrollback dir: %w", err)
+	}
+
+	idx, err := s.loadIndexUnlocked()
+	if err != nil {
+		return err
+	}
+
+	if idx.Sessions != nil {
+		delete(idx.Sessions, name)
+	}
+
+	idx.Updated = time.Now().UTC()
+
+	return writeJSONAtomic(s.indexPath(), idx)
 }
 
 func (s *Store) loadSessionUnlocked(name string, hydrate bool) (snapshot.SessionSnapshot, error) {
@@ -408,32 +370,6 @@ func (s *Store) loadSessionUnlocked(name string, hydrate bool) (snapshot.Session
 	}
 
 	return out, nil
-}
-
-func (s *Store) updateIndex(sessionSnapshot snapshot.SessionSnapshot, path string) error {
-	return s.withIndexLock(func() error {
-		idx, err := s.loadIndexUnlocked()
-		if err != nil {
-			return err
-		}
-
-		panes := 0
-		for _, w := range sessionSnapshot.Windows {
-			panes += len(w.Panes)
-		}
-
-		idx.Sessions[sessionSnapshot.SessionName] = snapshot.Record{
-			SessionName:  sessionSnapshot.SessionName,
-			File:         path,
-			CapturedAt:   sessionSnapshot.CapturedAt.UTC(),
-			LastAccessed: idx.Sessions[sessionSnapshot.SessionName].LastAccessed,
-			Windows:      len(sessionSnapshot.Windows),
-			Panes:        panes,
-		}
-		idx.Updated = time.Now().UTC()
-
-		return writeJSONAtomic(s.indexPath(), idx)
-	})
 }
 
 func (s *Store) ensureLayout() error {
@@ -557,88 +493,6 @@ func (s *Store) planScrollbackUnlocked(
 	}
 
 	return safeName, entries, nil
-}
-
-func (s *Store) persistScrollbackUnlocked(
-	sessionName, safeName string,
-	entries []scrollbackEntry,
-) error {
-	scrollRoot := filepath.Clean(filepath.Join(s.baseDir, scrollbackDir))
-	sessionDir := filepath.Clean(filepath.Join(scrollRoot, safeName))
-
-	err := ensureUnderDir(scrollRoot, sessionDir, sessionName)
-	if err != nil {
-		return err
-	}
-
-	stageDir := sessionDir + ".tmp"
-	_ = os.RemoveAll(stageDir)
-
-	defer func() { _ = os.RemoveAll(stageDir) }()
-
-	if len(entries) == 0 {
-		_ = os.RemoveAll(sessionDir)
-		_ = os.RemoveAll(stageDir)
-
-		return nil
-	}
-
-	err = os.MkdirAll(stageDir, scrollbackDirPerm)
-	if err != nil {
-		return fmt.Errorf("create stage dir: %w", err)
-	}
-
-	for _, ent := range entries {
-		path := filepath.Join(stageDir, ent.FileName)
-
-		err := os.WriteFile(path, []byte(ent.Content), scrollbackFilePerm)
-		if err != nil {
-			return fmt.Errorf("write scrollback file: %w", err)
-		}
-	}
-
-	err = promoteScrollbackStage(sessionDir, stageDir)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func promoteScrollbackStage(sessionDir, stageDir string) error {
-	backupDir := sessionDir + ".bak"
-	_ = os.RemoveAll(backupDir)
-
-	hadSessionDir := false
-
-	_, err := os.Stat(sessionDir)
-	if err == nil {
-		hadSessionDir = true
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("stat session dir: %w", err)
-	}
-
-	if hadSessionDir {
-		err := os.Rename(sessionDir, backupDir)
-		if err != nil {
-			return fmt.Errorf("backup session dir: %w", err)
-		}
-	}
-
-	err = os.Rename(stageDir, sessionDir)
-	if err != nil {
-		if hadSessionDir {
-			_ = os.Rename(backupDir, sessionDir)
-		}
-
-		return fmt.Errorf("promote stage dir: %w", err)
-	}
-
-	if hadSessionDir {
-		_ = os.RemoveAll(backupDir)
-	}
-
-	return nil
 }
 
 func (s *Store) hydrateScrollback(sessionSnapshot *snapshot.SessionSnapshot) error {
@@ -791,73 +645,10 @@ func countLines(s string) int {
 }
 
 func writeJSONAtomic(path string, v any) error {
-	tmp, err := writeJSONTemp(path, v, defaultFilePerm)
-	if err != nil {
-		return err
-	}
-
-	err = os.Rename(tmp, path)
-	if err != nil {
-		return fmt.Errorf("rename tmp file: %w", err)
-	}
-
-	return nil
-}
-
-func writeJSONTemp(path string, v any, perm os.FileMode) (string, error) {
 	jsonData, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
-		return "", fmt.Errorf("marshal json: %w", err)
+		return fmt.Errorf("marshal json: %w", err)
 	}
 
-	tmp := path + ".tmp"
-
-	err = os.WriteFile(tmp, append(jsonData, '\n'), perm)
-	if err != nil {
-		return "", fmt.Errorf("write temp file: %w", err)
-	}
-
-	return tmp, nil
-}
-
-func (s *Store) saveSessionUnlocked(sessionSnapshot snapshot.SessionSnapshot) error {
-	sessionSnapshot.Version = snapshot.FormatVersion
-	err := s.ensureLayout()
-	if err != nil {
-		return err
-	}
-
-	safeName, entries, err := s.planScrollbackUnlocked(&sessionSnapshot)
-	if err != nil {
-		return err
-	}
-
-	path := s.sessionPath(sessionSnapshot.SessionName)
-	err = backupLegacyAntex(path)
-	if err != nil {
-		return err
-	}
-
-	jsonTmp, err := writeJSONTemp(path, sessionSnapshot, defaultFilePerm)
-	if err != nil {
-		return err
-	}
-
-	defer func() { _ = os.Remove(jsonTmp) }()
-
-	err = s.persistScrollbackUnlocked(
-		sessionSnapshot.SessionName,
-		safeName,
-		entries,
-	)
-	if err != nil {
-		return err
-	}
-
-	err = os.Rename(jsonTmp, path)
-	if err != nil {
-		return fmt.Errorf("rename tmp file: %w", err)
-	}
-
-	return s.updateIndex(sessionSnapshot, path)
+	return writeFileAtomic(path, append(jsonData, '\n'), defaultFilePerm)
 }

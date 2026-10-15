@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"github.com/alchemmist/lazy-tmux/internal/atomicfile"
 	"github.com/alchemmist/lazy-tmux/internal/integration/agent"
@@ -27,33 +28,68 @@ func (s *Store) RepairAgent(
 	if err != nil {
 		return snapshot.Pane{}, fmt.Errorf("invalid repaired identity: %w", err)
 	}
-	unlock, err := s.lockSessionMutation(session)
+
+	var out snapshot.Pane
+
+	err = s.withGenerationLock(syscall.LOCK_EX, func() error {
+		repaired, repairErr := s.repairAgentLocked(
+			session,
+			windowIndex,
+			paneIndex,
+			value,
+			apply,
+		)
+		out = repaired
+
+		return repairErr
+	})
 	if err != nil {
 		return snapshot.Pane{}, err
 	}
-	defer unlock()
+
+	return out, nil
+}
+
+func (s *Store) repairAgentLocked(
+	session string,
+	windowIndex, paneIndex int,
+	value snapshot.AgentSession,
+	apply bool,
+) (snapshot.Pane, error) {
+	if apply {
+		recoverErr := s.recoverGenerationsLocked()
+		if recoverErr != nil {
+			return snapshot.Pane{}, recoverErr
+		}
+	}
+
 	state, err := s.loadSessionUnlocked(session, true)
 	if err != nil {
 		return snapshot.Pane{}, err
 	}
+
 	pane := savedPane(&state, windowIndex, paneIndex)
 	if pane == nil {
 		return snapshot.Pane{}, errSavedPaneMissing
 	}
+
 	pane.Agent = &value
 	pane.CurrentCmd = value.Kind
 	pane.RestoreCmd = ""
 	pane.CurrentPath = value.CWD
+
 	if !apply {
 		return *pane, nil
 	}
-	err = s.backupAgentRepair(session)
-	if err != nil {
-		return snapshot.Pane{}, err
+
+	backupErr := s.backupAgentRepair(session)
+	if backupErr != nil {
+		return snapshot.Pane{}, backupErr
 	}
-	err = s.saveSessionUnlocked(state)
-	if err != nil {
-		return snapshot.Pane{}, err
+
+	saveErr := s.saveSessionsLocked([]snapshot.SessionSnapshot{state})
+	if saveErr != nil {
+		return snapshot.Pane{}, saveErr
 	}
 
 	return *pane, nil

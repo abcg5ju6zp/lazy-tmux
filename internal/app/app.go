@@ -147,27 +147,94 @@ func buildRegistry(cfg config.IntegrationsConfig, statusDir string) *integration
 	return integration.NewRegistry(items...)
 }
 
+// captureResult carries one captured session through the parallel capture
+// phase of a save-all generation.
+type captureResult struct {
+	snap snapshot.SessionSnapshot
+	err  error
+}
+
+// SaveAll fixes the current session set, captures every session independently,
+// and hands the complete set to the store for one atomic generation publish.
+// A capture failure for any session aborts the cycle before any file changes,
+// so the previous generation stays fully recoverable.
 func (a *App) SaveAll() (int, error) {
 	sessions, err := a.tmux.ListSessions()
 	if err != nil {
 		return 0, fmt.Errorf("list sessions: %w", err)
 	}
 
-	integrationScope := a.integrations.Scope()
-	errs := parallelMap(sessions, saveAllWorkerLimit, func(session string) error {
-		return a.saveSession(session, integrationScope)
-	})
-	for _, err := range errs {
-		if err != nil {
-			return 0, err
-		}
+	sessions = uniqueSessionNames(sessions)
+
+	if len(sessions) == 0 {
+		return 0, nil
 	}
 
-	return len(sessions), nil
+	integrationScope := a.integrations.Scope()
+
+	results := parallelMap(sessions, saveAllWorkerLimit, func(session string) captureResult {
+		snap, captureErr := a.captureSession(session, integrationScope)
+
+		return captureResult{snap: snap, err: captureErr}
+	})
+
+	snaps := make([]snapshot.SessionSnapshot, 0, len(sessions))
+
+	for index, result := range results {
+		if result.err != nil {
+			return 0, fmt.Errorf("capture session %q: %w", sessions[index], result.err)
+		}
+
+		snaps = append(snaps, result.snap)
+	}
+
+	err = a.store.SaveSessions(snaps)
+	if err != nil {
+		return 0, fmt.Errorf("save sessions: %w", err)
+	}
+
+	return len(snaps), nil
+}
+
+func uniqueSessionNames(sessions []string) []string {
+	seen := make(map[string]struct{}, len(sessions))
+	unique := make([]string, 0, len(sessions))
+
+	for _, session := range sessions {
+		if _, ok := seen[session]; ok {
+			continue
+		}
+
+		seen[session] = struct{}{}
+		unique = append(unique, session)
+	}
+
+	return unique
 }
 
 func (a *App) SaveSession(session string) error {
-	return a.saveSession(session, a.integrations.Scope())
+	snap, err := a.captureSession(session, a.integrations.Scope())
+	if err != nil {
+		return err
+	}
+
+	err = a.store.SaveSession(snap)
+	if err != nil {
+		return fmt.Errorf("save session: %w", err)
+	}
+
+	return nil
+}
+
+// Recover converges snapshot generations left behind by a daemon that exited
+// mid-publish. It is safe to call on a clean data directory.
+func (a *App) Recover() error {
+	err := a.store.RecoverGenerations()
+	if err != nil {
+		return fmt.Errorf("recover snapshot generations: %w", err)
+	}
+
+	return nil
 }
 
 func (a *App) SaveCurrent() error {
@@ -224,10 +291,16 @@ func (a *App) ListRecords() ([]snapshot.Record, error) {
 	return records, nil
 }
 
-func (a *App) saveSession(session string, integrationScope *integration.Registry) error {
+// captureSession captures one live tmux session and enriches it with
+// scrollback and integration metadata. It performs no storage writes, so a
+// failure here leaves every previously saved generation untouched.
+func (a *App) captureSession(
+	session string,
+	integrationScope *integration.Registry,
+) (snapshot.SessionSnapshot, error) {
 	snap, err := a.tmux.CaptureSession(session)
 	if err != nil {
-		return fmt.Errorf("capture session: %w", err)
+		return snapshot.SessionSnapshot{}, fmt.Errorf("capture session: %w", err)
 	}
 
 	if a.cfg.Scrollback.Enabled {
@@ -236,12 +309,7 @@ func (a *App) saveSession(session string, integrationScope *integration.Registry
 
 	integrationScope.Enrich(&snap)
 
-	err = a.store.SaveSession(snap)
-	if err != nil {
-		return fmt.Errorf("save session: %w", err)
-	}
-
-	return nil
+	return snap, nil
 }
 
 func (a *App) restoreSessionForTarget(ctx context.Context, target PickerTarget) error {

@@ -42,6 +42,13 @@ func (a *App) RunDaemon(interval time.Duration) error {
 	ticker := newDaemonTicker(interval)
 	defer ticker.Stop()
 
+	// Converge any generation a previous daemon left unfinished before the
+	// first save of this process.
+	err = a.Recover()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "lazy-tmux daemon recovery error: %v\n", err)
+	}
+
 	err = a.runDaemonSaveAll()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "lazy-tmux daemon save error: %v\n", err)
