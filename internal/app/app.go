@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -49,6 +50,13 @@ type tmuxSessionCapturer interface {
 
 type tmuxSessionRestorer interface {
 	RestoreSession(ctx context.Context, snap snapshot.SessionSnapshot) error
+	RestoreSessionJournaled(
+		ctx context.Context,
+		snap snapshot.SessionSnapshot,
+		journal *tmux.RestoreJournal,
+		commit tmux.RestoreJournalCommit,
+	) error
+	CleanupRestoreJournal(journal *tmux.RestoreJournal, commit tmux.RestoreJournalCommit) error
 	SwitchClient(target string) error
 	SynchronizeWindowSize(target string) error
 	AttachSession(target string) error
@@ -184,20 +192,32 @@ func (a *App) Restore(session string, switchClient bool) error {
 }
 
 func (a *App) RestoreTarget(target PickerTarget, switchClient bool) error {
-	preExisted := a.tmux.SessionExists(strings.TrimSpace(target.SessionName))
-	err := a.restoreSessionForTarget(context.Background(), target)
+	generation, err := a.beginRestoreGeneration(target)
+	if err != nil {
+		return err
+	}
+	defer generation.release()
+
+	err = a.driveRestoreGeneration(context.Background(), target, generation)
 	if err != nil {
 		return err
 	}
 
 	if switchClient {
-		return a.handoffToTarget(target, false, !preExisted)
+		return a.finishRestoreGeneration(target, generation, false)
 	}
 
-	return nil
+	return a.skipRestoreHandoff(generation)
 }
 
 func (a *App) Bootstrap(session string) error {
+	// Converge generations interrupted by a previous process exit before
+	// restoring the bootstrap target.
+	reconcileErr := a.ReconcileRestoreJournals()
+	if reconcileErr != nil {
+		log.Printf("lazy-tmux: reconcile restores: %v", reconcileErr)
+	}
+
 	target := strings.TrimSpace(session)
 	if target == "" || target == "last" {
 		rec, err := a.store.LatestRecord()
@@ -239,30 +259,6 @@ func (a *App) saveSession(session string, integrationScope *integration.Registry
 	err = a.store.SaveSession(snap)
 	if err != nil {
 		return fmt.Errorf("save session: %w", err)
-	}
-
-	return nil
-}
-
-func (a *App) restoreSessionForTarget(ctx context.Context, target PickerTarget) error {
-	session := strings.TrimSpace(target.SessionName)
-	if session == "" {
-		return errSessionNameEmpty
-	}
-
-	snap, err := a.store.LoadSession(session)
-	if err != nil {
-		return fmt.Errorf("load session: %w", err)
-	}
-
-	err = a.tmux.RestoreSession(ctx, snap)
-	if err != nil && !errors.Is(err, tmux.ErrSessionExists) {
-		return fmt.Errorf("restore session: %w", err)
-	}
-
-	err = a.store.MarkSessionAccessed(session, time.Now().UTC())
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("mark session accessed: %w", err)
 	}
 
 	return nil

@@ -1,11 +1,32 @@
 package tmux
 
 import (
+	"context"
 	"strings"
 	"testing"
 
 	"github.com/alchemmist/lazy-tmux/internal/snapshot"
 )
+
+// restoreWindowCommandsTest drives one window through a throwaway generation.
+func restoreWindowCommandsTest(
+	t *testing.T,
+	client *Client,
+	window snapshot.Window,
+	index int,
+) {
+	t.Helper()
+
+	const session = "work"
+
+	journal := NewRestoreJournal(session, false)
+	err := client.restoreWindowCommandsJournaled(
+		context.Background(), session, window, index, journal, nil,
+	)
+	if err != nil {
+		t.Fatalf("restoreWindowCommands: %v", err)
+	}
+}
 
 type recordingRunner struct {
 	calls [][]string
@@ -57,9 +78,7 @@ func TestRestoreResolverOverridesCommand(t *testing.T) {
 		},
 	}
 
-	if err := client.restoreWindowCommands("work", window, 1); err != nil {
-		t.Fatalf("restoreWindowCommands: %v", err)
-	}
+	restoreWindowCommandsTest(t, client, window, 1)
 
 	sent := sentKeys(runner.calls)
 	if len(sent) != 2 {
@@ -104,9 +123,7 @@ func TestRestoreResolverRespectsAllowlist(t *testing.T) {
 		Panes: []snapshot.Pane{{Index: 0, CurrentCmd: "claude", RestoreCmd: "claude"}},
 	}
 
-	if err := client.restoreWindowCommands("work", window, 1); err != nil {
-		t.Fatalf("restoreWindowCommands: %v", err)
-	}
+	restoreWindowCommandsTest(t, client, window, 1)
 
 	for _, cmd := range sentKeys(runner.calls) {
 		if strings.Contains(cmd, "claude") {

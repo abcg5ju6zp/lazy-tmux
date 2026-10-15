@@ -49,6 +49,11 @@ func New(baseDir string) *Store {
 	}
 }
 
+// DataDir returns the root directory holding snapshots, indexes and locks.
+func (s *Store) DataDir() string {
+	return s.baseDir
+}
+
 func DefaultDataDir() string {
 	if v := strings.TrimSpace(os.Getenv("LAZY_TMUX_DATA_DIR")); v != "" {
 		return v

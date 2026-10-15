@@ -47,13 +47,12 @@ func TestAntexRestoreStagesIntentBeforeLaunch(t *testing.T) {
 	client := NewClientWithRunner("tmux", runner)
 	client.SetRestoreResolver(integration.NewRegistry(antex.New(t.TempDir())))
 	pane := snapshot.Pane{CurrentCmd: "antex"}
-	if err := client.restoreWindowCommands(
-		"work",
+	restoreWindowCommandsTest(
+		t,
+		client,
 		snapshot.Window{Panes: []snapshot.Pane{pane}},
 		0,
-	); err != nil {
-		t.Fatal(err)
-	}
+	)
 	for _, call := range runner.calls {
 		if strings.Contains(strings.Join(call, " "), "@lazy_tmux_restore_pending") {
 			return

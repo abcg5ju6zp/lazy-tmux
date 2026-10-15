@@ -14,6 +14,7 @@ import (
 	"github.com/alchemmist/lazy-tmux/internal/picker"
 	"github.com/alchemmist/lazy-tmux/internal/snapshot"
 	"github.com/alchemmist/lazy-tmux/internal/testutil"
+	"github.com/alchemmist/lazy-tmux/internal/tmux"
 )
 
 type recordingTmux struct {
@@ -27,6 +28,22 @@ type recordingTmux struct {
 }
 
 func (r *recordingTmux) RestoreSession(context.Context, snapshot.SessionSnapshot) error {
+	return nil
+}
+
+func (r *recordingTmux) RestoreSessionJournaled(
+	context.Context,
+	snapshot.SessionSnapshot,
+	*tmux.RestoreJournal,
+	tmux.RestoreJournalCommit,
+) error {
+	return nil
+}
+
+func (r *recordingTmux) CleanupRestoreJournal(
+	*tmux.RestoreJournal,
+	tmux.RestoreJournalCommit,
+) error {
 	return nil
 }
 func (r *recordingTmux) InsideTmux() bool          { return r.inside }

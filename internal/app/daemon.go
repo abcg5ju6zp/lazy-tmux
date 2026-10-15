@@ -42,6 +42,11 @@ func (a *App) RunDaemon(interval time.Duration) error {
 	ticker := newDaemonTicker(interval)
 	defer ticker.Stop()
 
+	reconcileErr := a.ReconcileRestoreJournals()
+	if reconcileErr != nil {
+		fmt.Fprintf(os.Stderr, "lazy-tmux reconcile restores error: %v\n", reconcileErr)
+	}
+
 	err = a.runDaemonSaveAll()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "lazy-tmux daemon save error: %v\n", err)

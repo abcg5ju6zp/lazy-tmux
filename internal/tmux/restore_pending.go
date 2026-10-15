@@ -1,6 +1,7 @@
 package tmux
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -27,15 +28,15 @@ func (client *Client) stageAgentRestore(
 	target string,
 	pane snapshot.Pane,
 	command string,
-) (string, error) {
+) (string, string, error) {
 	if agent.PaneKind(pane) == "" {
-		return command, nil
+		return "", command, nil
 	}
 	pane.Scrollback = nil
 	intent := pendingRestore{Token: rand.Text(), Pane: pane}
 	data, err := json.Marshal(intent)
 	if err != nil {
-		return "", fmt.Errorf("encode restore intent: %w", err)
+		return "", "", fmt.Errorf("encode restore intent: %w", err)
 	}
 	args := []string{
 		"set-option",
@@ -51,10 +52,10 @@ func (client *Client) stageAgentRestore(
 	}
 	_, err = client.Output(args...)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
-	return "env LAZY_TMUX_RESTORE_TOKEN=" + intent.Token + " " + command, nil
+	return intent.Token, "env LAZY_TMUX_RESTORE_TOKEN=" + intent.Token + " " + command, nil
 }
 
 func decodeRestoreIntent(encoded string) (pendingRestore, bool) {
@@ -115,6 +116,52 @@ func (client *Client) acknowledgeRestoredPanes(output string, windows []snapshot
 			)
 		}
 	}
+}
+
+// reconcileRestoreAcks completes acknowledgments for panes whose restore
+// command was staged by an earlier attempt of the generation but whose
+// confirmation (agent hook or capture) never ran. It uses the same readiness
+// rules as CaptureSession, so a token is acknowledged only when the pane is
+// demonstrably past startup.
+func (client *Client) reconcileRestoreAcks(ctx context.Context, sessionName string) {
+	if ctx.Err() != nil {
+		return
+	}
+
+	out, err := client.Output(
+		"list-panes",
+		"-s",
+		"-t",
+		sessionTarget(sessionName),
+		"-F",
+		"#{window_index}"+fieldSep+
+			"#{window_layout}"+fieldSep+
+			"#{window_active}"+fieldSep+
+			"#{window_name}"+fieldSep+
+			"#{pane_index}"+fieldSep+
+			"#{pane_active}"+fieldSep+
+			"#{pane_pid}"+fieldSep+
+			"#{pane_tty}"+fieldSep+
+			"#{pane_current_command}"+fieldSep+
+			"#{pane_current_path}"+fieldSep+
+			"#{pane_id}"+fieldSep+
+			"#{socket_path}"+fieldSep+
+			"#{@lazy_tmux_restore_pending}"+fieldSep+
+			"#{?@lazy_tmux_restore_ack,#{@lazy_tmux_restore_ack},#{@antex_restore_ack}}"+fieldSep+
+			"#{@lazy_tmux_agent_binding}"+fieldSep+
+			"#{@antex_binding}",
+	)
+	if err != nil {
+		return
+	}
+
+	//nolint:contextcheck // the ps-based process snapshot helper is context-free by design
+	processes, err := loadProcessSnapshot()
+	if err != nil {
+		return
+	}
+
+	client.acknowledgeRestoredPanes(out, parseCapturedPanes(out, processes))
 }
 
 func agentStartupCommand(command string) bool {

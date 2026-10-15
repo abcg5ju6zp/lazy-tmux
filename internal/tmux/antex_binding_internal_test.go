@@ -110,13 +110,12 @@ func TestRestoreNeverLaunchesGuessedAntexConversation(t *testing.T) {
 			if command, err := client.checkedRestoreCommand(pane); err == nil || command != "" {
 				t.Fatalf("ambiguous identity restored: %q %v", command, err)
 			}
-			if err := client.restoreWindowCommands(
-				"work",
+			restoreWindowCommandsTest(
+				t,
+				client,
 				snapshot.Window{Panes: []snapshot.Pane{pane, {Index: 1, CurrentCmd: "vim"}}},
 				0,
-			); err != nil {
-				t.Fatal(err)
-			}
+			)
 			sent := sentKeys(runner.calls)
 			if len(sent) != 2 || sent[1] != "vim" {
 				t.Fatalf("other panes must restore: %v", sent)

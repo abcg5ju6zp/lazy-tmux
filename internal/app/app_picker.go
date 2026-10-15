@@ -197,7 +197,11 @@ func toPickerStatus(status integration.Status) picker.WindowStatus {
 }
 
 func (a *App) RestoreTargetAnimated(target PickerTarget) (bool, error) {
-	preExisted := a.tmux.SessionExists(strings.TrimSpace(target.SessionName))
+	generation, err := a.beginRestoreGeneration(target)
+	if err != nil {
+		return false, err
+	}
+	defer generation.release()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -207,7 +211,7 @@ func (a *App) RestoreTargetAnimated(target PickerTarget) (bool, error) {
 	var restoreErr error
 
 	go func() {
-		restoreErr = a.restoreSessionForTarget(ctx, target)
+		restoreErr = a.driveRestoreGeneration(ctx, target, generation)
 		close(done)
 	}()
 
@@ -216,8 +220,14 @@ func (a *App) RestoreTargetAnimated(target PickerTarget) (bool, error) {
 		cancel()
 		<-done
 
-		if !preExisted {
-			a.killPartialRestore(target.SessionName)
+		// Stop unconfirmed stages is already guaranteed by ctx; converge the
+		// recorded resources under the same generation. Failure leaves a
+		// cleaning journal for the next restore or a process restart.
+		cleanupErr := a.convergeRestoreCleanup(&generation.journal)
+		if cleanupErr != nil {
+			log.Printf("lazy-tmux: cancel restore: %v", cleanupErr)
+		} else {
+			_ = a.deleteRestoreJournal(strings.TrimSpace(target.SessionName))
 		}
 
 		return true, nil
@@ -233,29 +243,22 @@ func (a *App) RestoreTargetAnimated(target PickerTarget) (bool, error) {
 		log.Printf("lazy-tmux: restore animation: %v", animErr)
 	}
 
-	return false, a.handoffToTarget(target, true, !preExisted)
-}
-
-func (a *App) killPartialRestore(session string) {
-	name := strings.TrimSpace(session)
-	if name == "" || !a.tmux.SessionExists(name) {
-		return
-	}
-
-	err := a.tmux.KillSession(name)
-	if err != nil {
-		log.Printf("lazy-tmux: cancel restore: kill session %s: %v", name, err)
-	}
+	return false, a.finishRestoreGeneration(target, generation, true)
 }
 
 func (a *App) RestoreTargetInteractive(target PickerTarget) error {
-	preExisted := a.tmux.SessionExists(strings.TrimSpace(target.SessionName))
-	err := a.restoreSessionForTarget(context.Background(), target)
+	generation, err := a.beginRestoreGeneration(target)
+	if err != nil {
+		return err
+	}
+	defer generation.release()
+
+	err = a.driveRestoreGeneration(context.Background(), target, generation)
 	if err != nil {
 		return err
 	}
 
-	return a.handoffToTarget(target, true, !preExisted)
+	return a.finishRestoreGeneration(target, generation, true)
 }
 
 func (a *App) SelectTargetWithTUI() (PickerTarget, error) {

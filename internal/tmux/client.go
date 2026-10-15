@@ -611,34 +611,66 @@ func (client *Client) RestoreSession(
 	ctx context.Context,
 	sessionSnapshot snapshot.SessionSnapshot,
 ) error {
+	journal := NewRestoreJournal(sessionSnapshot.SessionName, false)
+
+	return client.RestoreSessionJournaled(ctx, sessionSnapshot, journal, nil)
+}
+
+// RestoreJournalCommit persists the generation journal after each confirmed
+// step. It must be safe to call repeatedly.
+type RestoreJournalCommit func() error
+
+// RestoreSessionJournaled restores a snapshot under a stable generation.
+//
+// Each mutating step is recorded in the journal only after the corresponding
+// tmux command succeeds, so a retry or a process restart adopts the live
+// session/windows/panes instead of stacking a second set on top. Steps that
+// have not started are skipped once ctx is canceled; a successful mutation is
+// still recorded so that generation cleanup can remove it.
+func (client *Client) RestoreSessionJournaled(
+	ctx context.Context,
+	sessionSnapshot snapshot.SessionSnapshot,
+	journal *RestoreJournal,
+	commit RestoreJournalCommit,
+) error {
 	if sessionSnapshot.SessionName == "" {
 		return errEmptySessionName
-	}
-
-	if client.SessionExists(sessionSnapshot.SessionName) {
-		return ErrSessionExists
 	}
 
 	if len(sessionSnapshot.Windows) == 0 {
 		return errSnapshotHasNoWindows
 	}
 
+	if journal == nil {
+		journal = NewRestoreJournal(sessionSnapshot.SessionName, false)
+	}
+	if journal.Windows == nil {
+		journal.Windows = make(map[int]*WindowJournal)
+	}
+
+	sessionName := sessionSnapshot.SessionName
+
 	windows := make([]snapshot.Window, len(sessionSnapshot.Windows))
 	copy(windows, sessionSnapshot.Windows)
 	sort.Slice(windows, func(i, j int) bool { return windows[i].Index < windows[j].Index })
 
-	err := client.restoreFirstWindow(sessionSnapshot.SessionName, windows[0])
+	var (
+		pending []snapshot.Window
+		err     error
+	)
+
+	pending, err = client.ensureRestoreSession(ctx, sessionName, windows, journal, commit)
 	if err != nil {
 		return err
 	}
 
-	for idx := 1; idx < len(windows); idx++ {
+	for _, window := range pending {
 		err = restoreCanceled(ctx)
 		if err != nil {
 			return err
 		}
 
-		err = client.createAndPopulateWindow(sessionSnapshot.SessionName, windows[idx])
+		err = client.ensureWindow(ctx, sessionName, window, journal, commit)
 		if err != nil {
 			return err
 		}
@@ -649,11 +681,7 @@ func (client *Client) RestoreSession(
 		return err
 	}
 
-	client.selectRestoredFocus(sessionSnapshot, windows)
-
-	client.waitForRestoredCommands(ctx, sessionSnapshot.SessionName, windows)
-
-	return nil
+	return client.finalizeRestoredSession(ctx, sessionSnapshot, commit)
 }
 
 func restoreCanceled(ctx context.Context) error {
@@ -760,13 +788,44 @@ func (client *Client) CapturePane(target string) (snapshot.Pane, error) {
 	return pane, nil
 }
 
-func (client *Client) createAndPopulateWindow(sessionName string, win snapshot.Window) error {
-	err := client.runWithShellFallback(newWindowArgs(sessionName, win), "")
+// ensureWindow makes sure one snapshot window exists and is populated,
+// adopting a window that tmux created even when its creation confirmation was
+// lost (partial command success or process death mid restore).
+func (client *Client) ensureWindow(
+	ctx context.Context,
+	sessionName string,
+	win snapshot.Window,
+	journal *RestoreJournal,
+	commit RestoreJournalCommit,
+) error {
+	entry := journal.window(win.Index)
+	liveWindows := client.liveIndexes("list-windows", sessionTarget(sessionName), "#{window_index}")
+	windowLive := slices.Contains(liveWindows, win.Index)
+
+	if windowLive && entry.Created {
+		return client.ensureWindowContent(ctx, sessionName, win, journal, commit)
+	}
+
+	if !windowLive {
+		// This also covers a confirmed window that disappeared: recreating it
+		// is what lets the resumed generation converge instead of failing.
+		err := client.runWithShellFallback(newWindowArgs(sessionName, win))
+		if err != nil {
+			return err
+		}
+	}
+
+	entry.Created = true
+	if entry.Panes == 0 {
+		entry.Panes = 1
+	}
+
+	err := client.commitJournal(journal, commit)
 	if err != nil {
 		return err
 	}
 
-	return client.populateWindow(sessionName, win, win.Index)
+	return client.ensureWindowContent(ctx, sessionName, win, journal, commit)
 }
 
 func (client *Client) selectRestoredFocus(
@@ -793,11 +852,13 @@ func (client *Client) selectRestoredFocus(
 	)
 }
 
-func (client *Client) restoreFirstWindow(sessionName string, first snapshot.Window) error {
-	err := client.runWithShellFallback(
-		newSessionArgs(sessionName, first),
-		"",
-	)
+// createSessionWithFirstWindow runs new-session for the generation and moves
+// the initial window to the snapshot index when base-index differs.
+func (client *Client) createSessionWithFirstWindow(
+	sessionName string,
+	first snapshot.Window,
+) error {
+	err := client.runWithShellFallback(newSessionArgs(sessionName, first))
 	if err != nil {
 		return err
 	}
@@ -818,56 +879,106 @@ func (client *Client) restoreFirstWindow(sessionName string, first snapshot.Wind
 		}
 	}
 
-	return client.populateWindow(sessionName, first, first.Index)
+	return nil
 }
 
-func (client *Client) populateWindow(
+// ensureWindowContent reconciles panes, scrollback, commands and layout for one
+// window against the generation journal.
+func (client *Client) ensureWindowContent(
+	ctx context.Context,
 	sessionName string,
 	window snapshot.Window,
-	windowIndex int,
+	journal *RestoreJournal,
+	commit RestoreJournalCommit,
 ) error {
-	err := client.ensurePaneCount(sessionName, window, windowIndex)
+	entry := journal.window(window.Index)
+
+	err := client.ensurePaneCount(ctx, sessionName, window, window.Index, journal, commit)
 	if err != nil {
 		return err
 	}
 
-	client.restoreWindowScrollback(sessionName, window, windowIndex)
-
-	err = client.restoreWindowCommands(sessionName, window, windowIndex)
+	err = client.restoreWindowScrollback(ctx, sessionName, window, window.Index, journal, commit)
 	if err != nil {
 		return err
 	}
 
-	if window.Layout != "" {
+	err = client.restoreWindowCommandsJournaled(
+		ctx, sessionName, window, window.Index, journal, commit,
+	)
+	if err != nil {
+		return err
+	}
+
+	if window.Layout != "" && !entry.Layout {
 		_, _ = client.Output(
 			"select-layout",
 			"-t",
-			sessionWindowTarget(sessionName, windowIndex),
+			sessionWindowTarget(sessionName, window.Index),
 			window.Layout,
 		)
+		entry.Layout = true
+		_ = client.commitJournal(journal, commit)
 	}
 
 	return nil
 }
 
 func (client *Client) ensurePaneCount(
+	ctx context.Context,
 	sessionName string,
 	window snapshot.Window,
 	windowIndex int,
+	journal *RestoreJournal,
+	commit RestoreJournalCommit,
 ) error {
-	if len(window.Panes) <= 1 {
-		return nil
-	}
+	entry := journal.window(windowIndex)
+	livePanes := client.liveIndexes(
+		"list-panes",
+		sessionWindowTarget(sessionName, windowIndex),
+		"#{pane_index}",
+	)
 
-	for i := 1; i < len(window.Panes); i++ {
-		pane := window.Panes[i]
+	var err error
+
+	for len(livePanes) < len(window.Panes) {
+		pane := window.Panes[len(livePanes)]
+		err = restoreCanceled(ctx)
+		if err != nil {
+			return err
+		}
+
 		args := []string{"split-window", "-d", "-t", sessionWindowTarget(sessionName, windowIndex)}
 
 		if pane.CurrentPath != "" {
 			args = append(args, "-c", pane.CurrentPath)
 		}
 
-		err := client.runWithShellFallback(args, "")
+		err = client.runWithShellFallback(args)
+		if err != nil {
+			return err
+		}
+
+		livePanes = client.liveIndexes(
+			"list-panes",
+			sessionWindowTarget(sessionName, windowIndex),
+			"#{pane_index}",
+		)
+
+		if entry.Panes < len(livePanes) {
+			entry.Panes = len(livePanes)
+			err = client.commitJournal(journal, commit)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	// Adopt panes tmux created without a recorded confirmation so that they are
+	// never split a second time on resume.
+	if entry.Panes < len(livePanes) {
+		entry.Panes = len(livePanes)
+		err = client.commitJournal(journal, commit)
 		if err != nil {
 			return err
 		}
@@ -972,46 +1083,177 @@ func sanitizeCommand(cmd string) string {
 	return cmd
 }
 
-func (client *Client) restoreWindowCommands(
+// paneRestoreReceipt holds the pending token and ack found on a live pane.
+type paneRestoreReceipt struct {
+	token string
+	ack   string
+}
+
+// paneRestoreReceipts reports staged restore tokens and acknowledgments for
+// every live pane of the session. It lets a resumed generation distinguish a
+// pane whose command was already staged from one that still needs replay.
+func (client *Client) paneRestoreReceipts(sessionName string) map[string]paneRestoreReceipt {
+	result := make(map[string]paneRestoreReceipt)
+
+	out, err := client.Output(
+		"list-panes",
+		"-s",
+		"-t",
+		sessionTarget(sessionName),
+		"-F",
+		"#{window_index}"+fieldSep+
+			"#{pane_index}"+fieldSep+
+			"#{@lazy_tmux_restore_pending}"+fieldSep+
+			"#{?@lazy_tmux_restore_ack,#{@lazy_tmux_restore_ack},#{@antex_restore_ack}}",
+	)
+	if err != nil {
+		return result
+	}
+
+	for _, line := range splitLines(out) {
+		parts := splitFieldsN(line, paneReceiptFields)
+		if len(parts) != paneReceiptFields {
+			continue
+		}
+
+		token := ""
+		if intent, ok := decodeRestoreIntent(parts[2]); ok {
+			token = intent.Token
+		}
+
+		result[parts[0]+"."+parts[1]] = paneRestoreReceipt{
+			token: token,
+			ack:   strings.TrimSpace(parts[3]),
+		}
+	}
+
+	return result
+}
+
+func (client *Client) restoreWindowCommandsJournaled(
+	ctx context.Context,
 	sessionName string,
 	window snapshot.Window,
 	windowIndex int,
+	journal *RestoreJournal,
+	commit RestoreJournalCommit,
 ) error {
 	if len(window.Panes) == 0 {
 		return nil
 	}
 
+	entry := journal.window(windowIndex)
+
 	panes := make([]snapshot.Pane, len(window.Panes))
 	copy(panes, window.Panes)
 	sort.Slice(panes, func(i, j int) bool { return panes[i].Index < panes[j].Index })
 
+	var receipts map[string]paneRestoreReceipt
+	if commit != nil {
+		receipts = client.paneRestoreReceipts(sessionName)
+	}
+
 	for _, pane := range panes {
-		cmd, resolveErr := client.checkedRestoreCommand(pane)
-		if resolveErr != nil {
-			message := "lazy-tmux: automatic resume skipped: " + resolveErr.Error()
-			cmd = "printf '%s\\n' '" + strings.ReplaceAll(message, "'", "'\"'\"'") + "'"
-		}
-		if strings.TrimSpace(cmd) == "" {
-			continue
-		}
-
-		if resolveErr == nil && !client.commandAllowed(cmd) {
-			continue
-		}
-
-		target := sessionPaneTarget(sessionName, windowIndex, pane.Index)
-		cmd, err := client.stageAgentRestore(target, pane, cmd)
-		if err != nil {
-			return err
-		}
-
-		_, err = client.Output("send-keys", "-t", target, cmd, "C-m")
+		err := client.restorePaneCommand(
+			ctx, sessionName, windowIndex, pane, receipts, entry, journal, commit,
+		)
 		if err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+// restorePaneCommand restores a single pane unless its command was already
+// confirmed for the generation.
+func (client *Client) restorePaneCommand(
+	ctx context.Context,
+	sessionName string,
+	windowIndex int,
+	pane snapshot.Pane,
+	receipts map[string]paneRestoreReceipt,
+	entry *WindowJournal,
+	journal *RestoreJournal,
+	commit RestoreJournalCommit,
+) error {
+	if _, sent := entry.Commands[pane.Index]; sent {
+		return nil
+	}
+
+	key := fmt.Sprintf("%d.%d", windowIndex, pane.Index)
+	if receipt, ok := receipts[key]; ok && receipt.token != "" {
+		// The pending token is still on the live pane: the command was already
+		// staged, so keep the token instead of launching a second agent. The
+		// ack is completed later once the pane is ready.
+		entry.Commands[pane.Index] = receipt.token
+
+		return client.commitJournal(journal, commit)
+	}
+
+	target := sessionPaneTarget(sessionName, windowIndex, pane.Index)
+
+	marker, err := client.stagePaneRestoreCommand(ctx, target, pane)
+	if err != nil {
+		return err
+	}
+	if marker == "" {
+		return nil
+	}
+
+	entry.Commands[pane.Index] = marker
+
+	return client.commitJournal(journal, commit)
+}
+
+// stagePaneRestoreCommand resolves, guards, stages and sends one pane restore
+// command. It returns the confirmation marker, or an empty string when this
+// pane has no command to launch.
+func (client *Client) stagePaneRestoreCommand(
+	ctx context.Context,
+	target string,
+	pane snapshot.Pane,
+) (string, error) {
+	cmd, resolveErr := client.checkedRestoreCommand(pane)
+	if resolveErr != nil {
+		message := "lazy-tmux: automatic resume skipped: " + resolveErr.Error()
+		cmd = "printf '%s\\n' '" + strings.ReplaceAll(message, "'", "'\"'\"'") + "'"
+	}
+
+	if strings.TrimSpace(cmd) == "" {
+		return "", nil
+	}
+
+	if resolveErr == nil && !client.commandAllowed(cmd) {
+		return "", nil
+	}
+
+	var (
+		token      string
+		stagedCmd  string
+		err        error
+	)
+
+	err = restoreCanceled(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	token, stagedCmd, err = client.stageAgentRestore(target, pane, cmd)
+	if err != nil {
+		return "", err
+	}
+
+	_, err = client.Output("send-keys", "-t", target, stagedCmd, "C-m")
+	if err != nil {
+		return "", err
+	}
+
+	if token != "" {
+		return token, nil
+	}
+
+	return commandConfirmed, nil
 }
 
 func (client *Client) commandAllowed(command string) bool {
@@ -1130,21 +1372,35 @@ func (client *Client) waitForRestoredCommands(
 }
 
 func (client *Client) restoreWindowScrollback(
+	ctx context.Context,
 	sessionName string,
 	window snapshot.Window,
 	windowIndex int,
-) {
+	journal *RestoreJournal,
+	commit RestoreJournalCommit,
+) error {
 	if len(window.Panes) == 0 {
-		return
+		return nil
 	}
+
+	entry := journal.window(windowIndex)
 
 	panes := make([]snapshot.Pane, len(window.Panes))
 	copy(panes, window.Panes)
 	sort.Slice(panes, func(i, j int) bool { return panes[i].Index < panes[j].Index })
 
 	for _, pane := range panes {
+		if slices.Contains(entry.Scrollback, pane.Index) {
+			continue
+		}
+
 		if pane.Scrollback == nil || strings.TrimSpace(pane.Scrollback.Content) == "" {
 			continue
+		}
+
+		err := restoreCanceled(ctx)
+		if err != nil {
+			return err
 		}
 
 		target := sessionPaneTarget(sessionName, windowIndex, pane.Index)
@@ -1158,7 +1414,17 @@ func (client *Client) restoreWindowScrollback(
 		if err != nil {
 			continue
 		}
+
+		entry.Scrollback = append(entry.Scrollback, pane.Index)
+		slices.Sort(entry.Scrollback)
+
+		err = client.commitJournal(journal, commit)
+		if err != nil {
+			return err
+		}
 	}
+
+	return nil
 }
 
 func writePaneTTY(path, content string) error {
@@ -1394,6 +1660,7 @@ const (
 	livePaneLineFields    = 7
 	capturePaneLineFields = 16
 	paneCommandFields     = 3
+	paneReceiptFields     = 4
 	psLineFields          = 4
 )
 
@@ -1439,26 +1706,18 @@ func splitLines(in string) []string {
 	return out
 }
 
-func (client *Client) runWithShellFallback(args []string, cmd string) error {
+func (client *Client) runWithShellFallback(args []string) error {
 	_, err := client.Output(args...)
 	if err == nil {
 		return nil
 	}
 
-	withoutCmd := args
-	if strings.TrimSpace(cmd) != "" && len(args) > 0 {
-		withoutCmd = args[:len(args)-1]
-
-		_, err2 := client.Output(withoutCmd...)
-		if err2 == nil {
-			return nil
-		}
-	}
-
-	minimal := stripOptionPair(withoutCmd, "-c")
+	// Older tmux servers or unusual shells may reject path/start-command
+	// options; retry with progressively smaller argument sets.
+	minimal := stripOptionPair(args, "-c")
 	if len(minimal) > 0 {
-		_, err3 := client.Output(minimal...)
-		if err3 == nil {
+		_, err2 := client.Output(minimal...)
+		if err2 == nil {
 			return nil
 		}
 	}
