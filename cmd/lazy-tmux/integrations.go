@@ -268,7 +268,8 @@ func repairIntegration(args []string, cfg config.Config, stdout io.Writer) error
 	if *home == "" {
 		*home = agentHome(cfg, *kind)
 	}
-	storage := store.New(cfg.DataDir)
+	identity := tmux.NewClient(config.ExpandHome(cfg.TmuxBin)).ServerIdentity()
+	storage := store.NewForServer(cfg.DataDir, identity)
 	state, err := storage.LoadSessionMetadata(*session)
 	if err != nil {
 		return fmt.Errorf("integration operation: %w", err)

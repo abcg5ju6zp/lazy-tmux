@@ -108,7 +108,7 @@ func TestSessionFZFLinesAligned(t *testing.T) {
 		}
 	}
 
-	if got := strings.Split(lines[0], "\t"); got[len(got)-1] != "tmp" {
+	if got := strings.Split(lines[0], "\t"); got[len(got)-2] != "tmp" {
 		t.Fatalf("hidden name field wrong: %#v", got)
 	}
 }
@@ -133,12 +133,13 @@ func assertEqualDisplayWidths(t *testing.T, lines []string) {
 func TestParseWindowSelection(t *testing.T) {
 	t.Parallel()
 
-	target, err := parseWindowSelection("editor  nvim  2026-01-02 03:04:05\twork\t3")
+	target, err := parseWindowSelection("editor  nvim  2026-01-02 03:04:05\twork\t3\tsrv-1")
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
 
-	if target.SessionName != "work" || target.WindowIndex == nil || *target.WindowIndex != 3 {
+	if target.SessionName != "work" || target.WindowIndex == nil || *target.WindowIndex != 3 ||
+		target.ServerID != "srv-1" {
 		t.Fatalf("unexpected target: %+v", target)
 	}
 
@@ -215,7 +216,7 @@ func TestChooseSessionFZFFilterMode(t *testing.T) {
 		t.Fatalf("choose session fzf: %v", err)
 	}
 
-	if got != "alpha" {
-		t.Fatalf("expected first session 'alpha', got %q", got)
+	if got.SessionName != "alpha" {
+		t.Fatalf("expected first session 'alpha', got %+v", got)
 	}
 }

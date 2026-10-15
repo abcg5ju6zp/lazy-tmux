@@ -54,10 +54,32 @@ func TestConcurrentSaveAllPreservesEverySession(t *testing.T) {
 	}
 }
 
+func snapshotPath(t *testing.T, dir, name string) string {
+	t.Helper()
+
+	patterns := []string{
+		filepath.Join(dir, "servers", "*", "sessions", name+".json"),
+		filepath.Join(dir, "legacy", "sessions", name+".json"),
+	}
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			t.Fatalf("glob %s: %v", pattern, err)
+		}
+		if len(matches) == 1 {
+			return matches[0]
+		}
+	}
+
+	t.Fatalf("snapshot %s not found under %s", name, dir)
+
+	return ""
+}
+
 func readSnapshot(t *testing.T, dir, name string) snapshot.SessionSnapshot {
 	t.Helper()
 
-	b, err := os.ReadFile(filepath.Join(dir, "sessions", name+".json"))
+	b, err := os.ReadFile(snapshotPath(t, dir, name))
 	if err != nil {
 		t.Fatalf("read snapshot %s: %v", name, err)
 	}
@@ -178,7 +200,7 @@ func TestWakeupAndSleep(
 		t.Fatal("session should be asleep (killed) after sleep")
 	}
 
-	if _, err := os.Stat(filepath.Join(dir, "sessions", name+".json")); err != nil {
+	if _, err := os.Stat(snapshotPath(t, dir, name)); err != nil {
 		t.Fatalf("sleep should have saved a snapshot: %v", err)
 	}
 
@@ -209,7 +231,7 @@ func TestSaveAllAndForget(
 	}
 
 	for _, n := range []string{"one", "two"} {
-		if _, err := os.Stat(filepath.Join(dir, "sessions", n+".json")); err != nil {
+		if _, err := os.Stat(snapshotPath(t, dir, n)); err != nil {
 			t.Fatalf("save --all missing %s: %v", n, err)
 		}
 	}
@@ -218,8 +240,10 @@ func TestSaveAllAndForget(
 		t.Fatalf("forget: exit %d stderr=%q", code, errOut)
 	}
 
-	if _, err := os.Stat(filepath.Join(dir, "sessions", "one.json")); !os.IsNotExist(err) {
-		t.Fatalf("forget should remove snapshot, stat err=%v", err)
+	if matches, _ := filepath.Glob(
+		filepath.Join(dir, "servers", "*", "sessions", "one.json"),
+	); len(matches) != 0 {
+		t.Fatalf("forget should remove snapshot, found %v", matches)
 	}
 
 	_, out, _ := run(t, "list", "--data-dir", dir)

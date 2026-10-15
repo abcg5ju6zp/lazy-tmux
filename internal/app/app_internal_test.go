@@ -238,7 +238,7 @@ func TestOpenQuickSessionSwitchesLiveSessionWithoutSnapshot(t *testing.T) {
 	fake := &recordingTmux{inside: true, exists: true}
 	a.tmux = fake
 
-	if err := a.OpenQuickSession("live-only"); err != nil {
+	if err := a.OpenQuickSession(picker.QuickSession{Name: "live-only"}); err != nil {
 		t.Fatalf("open quick session: %v", err)
 	}
 	if fake.switched != "live-only" {
@@ -255,7 +255,7 @@ func TestOpenQuickSessionUpdatesLastUsed(t *testing.T) {
 	}
 	a.tmux = &recordingTmux{inside: true, exists: true}
 
-	if err := a.OpenQuickSession("live"); err != nil {
+	if err := a.OpenQuickSession(picker.QuickSession{Name: "live"}); err != nil {
 		t.Fatalf("open quick session: %v", err)
 	}
 	records, err := a.store.ListRecords()
@@ -312,7 +312,7 @@ func TestQuickPickerSessionMarksWorkingAntex(t *testing.T) {
 		t.Fatalf("Antex status blocked the initial session list: %+v", sessions)
 	}
 	working := a.quickWorkingSessions(sessions)
-	if !working["working"] {
+	if len(working) != 1 {
 		t.Fatalf("working Antex session was not detected: %+v", working)
 	}
 }
@@ -327,9 +327,18 @@ func newTestApp(t *testing.T) (*App, string) {
 }
 
 func snapshotExists(dir, name string) bool {
-	_, err := os.Stat(filepath.Join(dir, "sessions", name+".json"))
+	patterns := []string{
+		filepath.Join(dir, "servers", "*", "sessions", name+".json"),
+		filepath.Join(dir, "legacy", "sessions", name+".json"),
+	}
+	for _, pattern := range patterns {
+		matches, err := filepath.Glob(pattern)
+		if err == nil && len(matches) > 0 {
+			return true
+		}
+	}
 
-	return err == nil
+	return false
 }
 
 //nolint:paralleltest // uses a real shared tmux server via testutil.IsolatedTmux (t.Setenv)
@@ -365,7 +374,7 @@ func TestNewWindowLiveAndOffline(t *testing.T) {
 		t.Fatalf("new session: %v", err)
 	}
 
-	if err := a.NewWindow("multi", "second"); err != nil {
+	if err := a.NewWindow("", "multi", "second"); err != nil {
 		t.Fatalf("new window (live): %v", err)
 	}
 
@@ -382,7 +391,7 @@ func TestNewWindowLiveAndOffline(t *testing.T) {
 		t.Fatalf("kill: %v", err)
 	}
 
-	if err := a.NewWindow("multi", "third"); err != nil {
+	if err := a.NewWindow("", "multi", "third"); err != nil {
 		t.Fatalf("new window (offline): %v", err)
 	}
 
@@ -406,7 +415,7 @@ func TestRenameWindowLive(t *testing.T) {
 		t.Fatalf("new session: %v", err)
 	}
 
-	if err := a.RenameWindow("ren", 0, "renamed"); err != nil {
+	if err := a.RenameWindow("", "ren", 0, "renamed"); err != nil {
 		t.Fatalf("rename window: %v", err)
 	}
 
@@ -430,7 +439,7 @@ func TestRenameSession(t *testing.T) {
 		t.Fatalf("new session: %v", err)
 	}
 
-	if err := a.RenameSession("old", "brandnew"); err != nil {
+	if err := a.RenameSession("", "old", "brandnew"); err != nil {
 		t.Fatalf("rename session: %v", err)
 	}
 
@@ -457,11 +466,11 @@ func TestDeleteWindowAndSession(t *testing.T) {
 		t.Fatalf("new session: %v", err)
 	}
 
-	if err := a.NewWindow("del", "extra"); err != nil {
+	if err := a.NewWindow("", "del", "extra"); err != nil {
 		t.Fatalf("new window: %v", err)
 	}
 
-	if err := a.DeleteWindow("del", 1); err != nil {
+	if err := a.DeleteWindow("", "del", 1); err != nil {
 		t.Fatalf("delete window: %v", err)
 	}
 
@@ -469,7 +478,7 @@ func TestDeleteWindowAndSession(t *testing.T) {
 		t.Fatal("session should still exist after deleting one of two windows")
 	}
 
-	if err := a.DeleteSession("del"); err != nil {
+	if err := a.DeleteSession("", "del"); err != nil {
 		t.Fatalf("delete session: %v", err)
 	}
 
@@ -501,7 +510,7 @@ func TestSaveAllRestoreSleepWakeup(t *testing.T) {
 		t.Fatal("save all should snapshot both sessions")
 	}
 
-	if err := a.Sleep("s1"); err != nil {
+	if err := a.Sleep("", "s1"); err != nil {
 		t.Fatalf("sleep: %v", err)
 	}
 
@@ -509,11 +518,11 @@ func TestSaveAllRestoreSleepWakeup(t *testing.T) {
 		t.Fatal("s1 should be asleep")
 	}
 
-	if err := a.Sleep("s1"); err == nil {
+	if err := a.Sleep("", "s1"); err == nil {
 		t.Fatal("sleeping an already-asleep session should error")
 	}
 
-	if err := a.Wakeup("s1"); err != nil {
+	if err := a.Wakeup("", "s1"); err != nil {
 		t.Fatalf("wakeup: %v", err)
 	}
 
@@ -521,7 +530,7 @@ func TestSaveAllRestoreSleepWakeup(t *testing.T) {
 		t.Fatal("s1 should be awake after wakeup")
 	}
 
-	if err := a.Wakeup("s1"); err == nil {
+	if err := a.Wakeup("", "s1"); err == nil {
 		t.Fatal("waking an awake session should error")
 	}
 
@@ -605,8 +614,8 @@ func TestSelectWithFZFSorted(t *testing.T) {
 		t.Fatalf("select with fzf: %v", err)
 	}
 
-	if got != "only" {
-		t.Fatalf("expected fzf to pick 'only', got %q", got)
+	if got.SessionName != "only" {
+		t.Fatalf("expected fzf to pick 'only', got %q", got.SessionName)
 	}
 }
 
@@ -675,7 +684,7 @@ func TestMergeLastAttached(t *testing.T) {
 		"fresher-stored": base.Add(time.Hour),
 	}
 
-	mergeLastAttached(records, attached)
+	mergeLastAttached(records, attached, recordServerID(records[0]))
 
 	if got := records[0].LastAccessed; !got.Equal(base.Add(time.Hour)) {
 		t.Fatalf("fresher-attach should take the newer attach time, got %v", got)
@@ -689,13 +698,13 @@ func TestMergeLastAttached(t *testing.T) {
 		t.Fatalf("not-live should be unchanged, got %v", got)
 	}
 
-	mergeLastAttached(records, nil)
+	mergeLastAttached(records, nil, "")
 }
 
 func TestPickerSnapshotCacheReusesAndInvalidatesMetadata(t *testing.T) {
 	t.Parallel()
 
-	a, dir := newTestApp(t)
+	a, _ := newTestApp(t)
 	first := snapshot.SessionSnapshot{
 		Version:     snapshot.FormatVersion,
 		SessionName: "cached",
@@ -709,13 +718,17 @@ func TestPickerSnapshotCacheReusesAndInvalidatesMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list first records: %v", err)
 	}
-	if _, err = a.pickerSnapshot(records[0]); err != nil {
+	if _, err = a.pickerSnapshot(recordServerID(records[0]), records[0]); err != nil {
 		t.Fatalf("prime cache: %v", err)
 	}
-	if err = os.Remove(filepath.Join(dir, "sessions", "cached.json")); err != nil {
+	cachedPath, err := a.store.SessionPath("cached")
+	if err != nil {
+		t.Fatalf("cached session path: %v", err)
+	}
+	if err = os.Remove(cachedPath); err != nil {
 		t.Fatalf("remove cached fixture: %v", err)
 	}
-	if _, err = a.pickerSnapshot(records[0]); err != nil {
+	if _, err = a.pickerSnapshot(recordServerID(records[0]), records[0]); err != nil {
 		t.Fatalf("unchanged record was reloaded: %v", err)
 	}
 
@@ -729,7 +742,7 @@ func TestPickerSnapshotCacheReusesAndInvalidatesMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list second records: %v", err)
 	}
-	loaded, err := a.pickerSnapshot(records[0])
+	loaded, err := a.pickerSnapshot(recordServerID(records[0]), records[0])
 	if err != nil {
 		t.Fatalf("reload changed record: %v", err)
 	}
@@ -761,7 +774,7 @@ func TestPickerSnapshotCoalescesConcurrentCacheMisses(t *testing.T) {
 	for range 32 {
 		group.Go(func() {
 			<-start
-			_, loadErr := a.pickerSnapshot(records[0])
+			_, loadErr := a.pickerSnapshot(recordServerID(records[0]), records[0])
 			errs <- loadErr
 		})
 	}

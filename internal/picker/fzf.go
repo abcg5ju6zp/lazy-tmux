@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/alchemmist/lazy-tmux/internal/snapshot"
+	"github.com/alchemmist/lazy-tmux/internal/store"
 	"github.com/charmbracelet/x/ansi"
 )
 
@@ -22,8 +23,6 @@ var (
 )
 
 const fzfSelectionTimeout = 30 * time.Second
-
-const windowLineParts = 3
 
 var (
 	ErrNoSessions = errors.New("no sessions available")
@@ -36,6 +35,8 @@ const (
 	fzfCmdMax  = 30
 	fzfColGap  = "  "
 	fzfMetaSep = " · "
+	// Hidden tab fields on a window line: display, session, index, server id.
+	fzfWindowFields = 4
 )
 
 const fzfMetaColor = "#9e9e9e"
@@ -110,7 +111,8 @@ func runFZF(input *bytes.Buffer, withNth string) (string, error) {
 	cmd := exec.CommandContext(
 		ctx,
 		args[0],
-		args[1:]...) // #nosec G204 -- argv[0] is the fzf binary with args built above
+		args[1:]...,
+	) // #nosec G204 -- argv[0] is the fzf binary with args built above
 	cmd.Stdin = input
 
 	out, err := cmd.Output()
@@ -133,37 +135,47 @@ func runFZF(input *bytes.Buffer, withNth string) (string, error) {
 }
 
 func sessionFZFLines(records []snapshot.Record) []string {
-	type row struct{ name, when, count string }
+	type row struct{ name, when, count, server string }
 
 	rows := make([]row, len(records))
 
 	var nameW, countW int
 
-	for idx, r := range records {
-		name := clampCell(r.SessionName, fzfNameMax)
-		rows[idx] = row{
-			name:  name,
-			when:  r.CapturedAt.Local().Format(fzfTimeLayout),
-			count: fmt.Sprintf("%dw", r.Windows),
+	for index, rec := range records {
+		name := clampCell(rec.SessionName, fzfNameMax)
+		rows[index] = row{
+			name:   name,
+			when:   rec.CapturedAt.Local().Format(fzfTimeLayout),
+			count:  fmt.Sprintf("%dw", rec.Windows),
+			server: recordServer(rec).ServerID,
 		}
 
 		nameW = maxInt(nameW, ansi.StringWidth(name))
-		countW = maxInt(countW, ansi.StringWidth(rows[idx].count))
+		countW = maxInt(countW, ansi.StringWidth(rows[index].count))
 	}
 
 	lines := make([]string, len(records))
-	for idx, item := range rows {
+	for index, item := range rows {
 		meta := fzfFg(fzfMetaColor, padLeft(item.count, countW)+fzfMetaSep+item.when)
 		display := padCell(item.name, nameW) + fzfColGap + meta
-		lines[idx] = display + "\t" + records[idx].SessionName
+		lines[index] = strings.Join(
+			[]string{display, records[index].SessionName, item.server},
+			"\t",
+		)
 	}
 
 	return lines
 }
 
-func ChooseSessionFZF(records []snapshot.Record) (string, error) {
+func recordServer(r snapshot.Record) Target {
+	return Target{SessionName: r.SessionName, ServerID: store.ServerID(r.ServerSocket)}
+}
+
+// ChooseSessionFZF returns the chosen session target, including the owning
+// server namespace.
+func ChooseSessionFZF(records []snapshot.Record) (Target, error) {
 	if len(records) == 0 {
-		return "", ErrNoSessions
+		return Target{}, ErrNoSessions
 	}
 
 	var input bytes.Buffer
@@ -175,26 +187,28 @@ func ChooseSessionFZF(records []snapshot.Record) (string, error) {
 
 	selected, err := runFZF(&input, "1")
 	if err != nil {
-		return "", err
+		return Target{}, err
 	}
 
-	parts := strings.Split(selected, "\t")
+	return parseSessionSelection(selected)
+}
 
-	name := strings.TrimSpace(parts[len(parts)-1])
+func parseSessionSelection(line string) (Target, error) {
+	parts := strings.Split(line, "\t")
+	if len(parts) < 2 {
+		return Target{}, errInvalidFzfOutput
+	}
+
+	name := strings.TrimSpace(parts[len(parts)-2])
 	if name == "" {
-		return "", errInvalidFzfOutput
+		return Target{}, errInvalidFzfOutput
 	}
 
-	return name, nil
+	return Target{SessionName: name, ServerID: strings.TrimSpace(parts[len(parts)-1])}, nil
 }
 
 func windowFZFLines(sessions []Session, windowSort []WindowSortKey) []string {
-	type row struct {
-		session, name, cmd, when string
-		index                    int
-	}
-
-	var rows []row
+	var rows []windowFZFRow
 
 	for _, session := range sessions {
 		windows := make([]snapshot.Window, len(session.Windows))
@@ -202,40 +216,23 @@ func windowFZFLines(sessions []Session, windowSort []WindowSortKey) []string {
 		sortWindows(windows, windowSort)
 
 		captured := session.Record.CapturedAt.Local().Format(fzfTimeLayout)
-
 		for _, window := range windows {
-			name := window.Name
-			if name == "" {
-				name = "-"
-			}
-
-			cmd := windowPreviewCommand(window)
-			if cmd == "" {
-				cmd = "-"
-			}
-
-			rows = append(rows, row{
-				session: session.Record.SessionName,
-				index:   window.Index,
-				name:    clampCell(name, fzfWinName),
-				cmd:     clampCell(cmd, fzfCmdMax),
-				when:    captured,
-			})
+			rows = append(rows, buildWindowRow(session, window, captured))
 		}
 	}
 
 	var sessW, idxW, nameW, cmdW int
 
-	for _, r := range rows {
-		sessW = maxInt(sessW, ansi.StringWidth(clampCell(r.session, fzfNameMax)))
-		idxW = maxInt(idxW, len(strconv.Itoa(r.index)))
-		nameW = maxInt(nameW, ansi.StringWidth(r.name))
-		cmdW = maxInt(cmdW, ansi.StringWidth(r.cmd))
+	for _, rowData := range rows {
+		sessW = maxInt(sessW, ansi.StringWidth(clampCell(rowData.session, fzfNameMax)))
+		idxW = maxInt(idxW, len(strconv.Itoa(rowData.index)))
+		nameW = maxInt(nameW, ansi.StringWidth(rowData.name))
+		cmdW = maxInt(cmdW, ansi.StringWidth(rowData.cmd))
 	}
 
 	lines := make([]string, len(rows))
 
-	for idx, item := range rows {
+	for index, item := range rows {
 		head := strings.Join([]string{
 			padCell(clampCell(item.session, fzfNameMax), sessW),
 			padLeft(strconv.Itoa(item.index), idxW),
@@ -244,30 +241,62 @@ func windowFZFLines(sessions []Session, windowSort []WindowSortKey) []string {
 
 		meta := fzfFg(fzfMetaColor, padCell(item.cmd, cmdW)+fzfMetaSep+item.when)
 		display := head + fzfColGap + meta
-
-		lines[idx] = fmt.Sprintf("%s\t%s\t%d", display, item.session, item.index)
+		lines[index] = fmt.Sprintf(
+			"%s\t%s\t%d\t%s",
+			display, item.session, item.index, item.server,
+		)
 	}
 
 	return lines
 }
 
+func buildWindowRow(session Session, window snapshot.Window, captured string) windowFZFRow {
+	name := window.Name
+	if name == "" {
+		name = "-"
+	}
+
+	cmd := windowPreviewCommand(window)
+	if cmd == "" {
+		cmd = "-"
+	}
+
+	return windowFZFRow{
+		session: session.Record.SessionName,
+		index:   window.Index,
+		name:    clampCell(name, fzfWinName),
+		cmd:     clampCell(cmd, fzfCmdMax),
+		when:    captured,
+		server:  session.ServerID,
+	}
+}
+
+type windowFZFRow struct {
+	session, name, cmd, when, server string
+	index                            int
+}
+
 func parseWindowSelection(line string) (Target, error) {
 	parts := strings.Split(line, "\t")
-	if len(parts) < windowLineParts {
+	if len(parts) < fzfWindowFields {
 		return Target{}, errInvalidFzfOutput
 	}
 
-	session := parts[len(parts)-2]
+	session := parts[len(parts)-3]
 	if strings.TrimSpace(session) == "" {
 		return Target{}, errInvalidFzfOutput
 	}
 
-	index, err := strconv.Atoi(strings.TrimSpace(parts[len(parts)-1]))
+	index, err := strconv.Atoi(strings.TrimSpace(parts[len(parts)-2]))
 	if err != nil {
 		return Target{}, fmt.Errorf("invalid window index in fzf output: %w", err)
 	}
 
-	return Target{SessionName: session, WindowIndex: &index}, nil
+	return Target{
+		SessionName: session,
+		WindowIndex: &index,
+		ServerID:    strings.TrimSpace(parts[len(parts)-1]),
+	}, nil
 }
 
 func ChooseWindowFZF(sessions []Session, windowSort []WindowSortKey) (Target, error) {

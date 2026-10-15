@@ -8,6 +8,6 @@ import (
 
 func runForget(args []string, stdout, stderr io.Writer) int {
 	return runSessionOp(args, stdout, stderr, cmdForget, false, func(a *app.App, s string) error {
-		return a.Forget(s)
+		return a.Forget("", s)
 	})
 }

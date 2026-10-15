@@ -69,7 +69,8 @@ func (client *Client) ApplyAgentHook(kind, home, pane string, event AgentHookEve
 		return fmt.Errorf("encode hook binding: %w", err)
 	}
 	_, err = client.Output(
-		hookPublishArgs(pane, string(body), event.Event, os.Getenv("LAZY_TMUX_RESTORE_TOKEN"))...)
+		hookPublishArgs(pane, string(body), event.Event, os.Getenv("LAZY_TMUX_RESTORE_TOKEN"))...,
+	)
 
 	return err
 }

@@ -144,8 +144,8 @@ func TestQuickPickerSelectsSession(t *testing.T) {
 	}, themeDark, []string{"control"})
 	model = updateQuick(t, model, tea.KeyPressMsg{Code: tea.KeyEnter})
 
-	if model.selected != "alpha" {
-		t.Fatalf("selected = %q, want alpha", model.selected)
+	if model.selected.Name != "alpha" {
+		t.Fatalf("selected = %q, want alpha", model.selected.Name)
 	}
 }
 
@@ -203,10 +203,10 @@ func TestQuickPickerLoadsWorkingStatusesAfterInitialization(t *testing.T) {
 	t.Parallel()
 
 	loadCalls := 0
-	loader := func() map[string]bool {
+	loader := func() map[string]QuickSession {
 		loadCalls++
 
-		return map[string]bool{"bravo": true}
+		return map[string]QuickSession{quickKey(QuickSession{Name: "bravo"}): {Name: "bravo"}}
 	}
 	model := newQuickPickerModel([]QuickSession{
 		{Name: "alpha", Restored: true, Current: false, Working: false},
@@ -248,8 +248,8 @@ func TestQuickPickerFiltersAndSelectsSessions(t *testing.T) {
 
 	model = updateQuick(t, model, keyRune('u'))
 	model = updateQuick(t, model, tea.KeyPressMsg{Code: tea.KeyEnter})
-	if model.selected != "jumpbox" {
-		t.Fatalf("selected = %q, want jumpbox", model.selected)
+	if model.selected.Name != "jumpbox" {
+		t.Fatalf("selected = %q, want jumpbox", model.selected.Name)
 	}
 }
 

@@ -165,17 +165,20 @@ func runFZFPicker(
 
 	if windows {
 		target, err = tmuxApp.SelectTargetWithFZFSorted(sortOpts)
+		if err != nil {
+			writeErr(stderr, fmt.Errorf("select target: %w", err))
+
+			return 1
+		}
 	} else {
-		var session string
+		selected, selectErr := tmuxApp.SelectWithFZFSorted(sortOpts)
+		if selectErr != nil {
+			writeErr(stderr, fmt.Errorf("select target: %w", selectErr))
 
-		session, err = tmuxApp.SelectWithFZFSorted(sortOpts)
-		target = app.PickerTarget{SessionName: session}
-	}
+			return 1
+		}
 
-	if err != nil {
-		writeErr(stderr, fmt.Errorf("select target: %w", err))
-
-		return 1
+		target = selected
 	}
 
 	err = tmuxApp.RestoreTargetInteractive(target)

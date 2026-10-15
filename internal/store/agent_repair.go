@@ -27,12 +27,20 @@ func (s *Store) RepairAgent(
 	if err != nil {
 		return snapshot.Pane{}, fmt.Errorf("invalid repaired identity: %w", err)
 	}
-	unlock, err := s.lockSessionMutation(session)
+
+	serverNS := s.boundNamespace()
+
+	err = s.ensureMigrated(serverNS)
+	if err != nil {
+		return snapshot.Pane{}, err
+	}
+
+	unlock, err := s.lockSessionMutation(serverNS, session)
 	if err != nil {
 		return snapshot.Pane{}, err
 	}
 	defer unlock()
-	state, err := s.loadSessionUnlocked(session, true)
+	state, err := s.loadSessionUnlocked(serverNS, session, true)
 	if err != nil {
 		return snapshot.Pane{}, err
 	}
@@ -47,11 +55,11 @@ func (s *Store) RepairAgent(
 	if !apply {
 		return *pane, nil
 	}
-	err = s.backupAgentRepair(session)
+	err = s.backupAgentRepair(serverNS, session)
 	if err != nil {
 		return snapshot.Pane{}, err
 	}
-	err = s.saveSessionUnlocked(state)
+	err = s.saveSessionUnlocked(serverNS, state)
 	if err != nil {
 		return snapshot.Pane{}, err
 	}
@@ -74,13 +82,13 @@ func savedPane(state *snapshot.SessionSnapshot, windowIndex, paneIndex int) *sna
 	return nil
 }
 
-func (s *Store) backupAgentRepair(session string) error {
-	root, err := os.OpenRoot(filepath.Dir(s.sessionPath(session)))
+func (s *Store) backupAgentRepair(serverNS namespace, session string) error {
+	root, err := os.OpenRoot(filepath.Dir(serverNS.sessionPath(session)))
 	if err != nil {
 		return fmt.Errorf("open repair directory: %w", err)
 	}
 	defer func() { _ = root.Close() }()
-	name := filepath.Base(s.sessionPath(session))
+	name := filepath.Base(serverNS.sessionPath(session))
 	original, err := root.ReadFile(name)
 	if err != nil {
 		return fmt.Errorf("read repair backup: %w", err)

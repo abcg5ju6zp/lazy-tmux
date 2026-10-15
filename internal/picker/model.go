@@ -773,26 +773,26 @@ func (m *pickerModel) enterModeShortcut(key string) {
 		m.markWindow(cur.target)
 	case "alt+d":
 		m.enterMode(actionDelete)
-		m.focusSession(cur.target.SessionName)
-		m.markSession(cur.target.SessionName)
+		m.focusSession(cur.target.ServerID, cur.target.SessionName)
+		m.markSession(cur.target.ServerID, cur.target.SessionName)
 	case "ctrl+r":
 		m.enterMode(actionRename)
 		m.focusWindow(cur.target)
 	case "alt+r":
 		m.enterMode(actionRename)
-		m.focusSession(cur.target.SessionName)
+		m.focusSession(cur.target.ServerID, cur.target.SessionName)
 	case "ctrl+n":
 		m.enterMode(actionNew)
-		m.focusSession(cur.target.SessionName)
+		m.focusSession(cur.target.ServerID, cur.target.SessionName)
 	case "alt+n":
 		m.enterMode(actionNew)
 		m.focusSynthetic()
 	case "alt+w":
 		m.enterMode(actionWake)
-		m.focusSession(cur.target.SessionName)
+		m.focusSession(cur.target.ServerID, cur.target.SessionName)
 	case "alt+s":
 		m.enterMode(actionSleep)
-		m.focusSession(cur.target.SessionName)
+		m.focusSession(cur.target.ServerID, cur.target.SessionName)
 	}
 }
 
@@ -802,7 +802,9 @@ func (m *pickerModel) focusWindow(target Target) {
 	}
 
 	for i, row := range m.visible {
-		if row.target.SessionName == target.SessionName && row.target.WindowIndex != nil &&
+		if row.target.ServerID == target.ServerID &&
+			row.target.SessionName == target.SessionName &&
+			row.target.WindowIndex != nil &&
 			*row.target.WindowIndex == *target.WindowIndex {
 			m.cursor = i
 			m.ensureCursorVisible()
@@ -812,9 +814,10 @@ func (m *pickerModel) focusWindow(target Target) {
 	}
 }
 
-func (m *pickerModel) focusSession(name string) {
+func (m *pickerModel) focusSession(serverID, name string) {
 	for i, row := range m.visible {
-		if !row.synthetic && row.target.WindowIndex == nil && row.target.SessionName == name {
+		if !row.synthetic && row.target.WindowIndex == nil &&
+			row.target.ServerID == serverID && row.target.SessionName == name {
 			m.cursor = i
 			m.ensureCursorVisible()
 
@@ -850,7 +853,7 @@ func (m *pickerModel) exitMode() {
 		if prev.target.WindowIndex != nil {
 			m.focusWindow(prev.target)
 		} else {
-			m.focusSession(prev.target.SessionName)
+			m.focusSession(prev.target.ServerID, prev.target.SessionName)
 			m.cursor = m.nearestSelectable(m.cursor)
 		}
 	}

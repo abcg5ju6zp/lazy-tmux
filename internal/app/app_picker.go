@@ -15,11 +15,16 @@ import (
 	"github.com/alchemmist/lazy-tmux/internal/integration/agent"
 	"github.com/alchemmist/lazy-tmux/internal/picker"
 	"github.com/alchemmist/lazy-tmux/internal/snapshot"
+	"github.com/alchemmist/lazy-tmux/internal/store"
 )
 
 var errNoSavedSessions = errors.New("no saved sessions found")
 
 const quickStatusWorkerLimit = 4
+
+func recordServerID(rec snapshot.Record) string {
+	return store.ServerID(rec.ServerSocket)
+}
 
 func (a *App) pickerRecords(opts PickerSortOptions) ([]snapshot.Record, error) {
 	records, err := a.store.ListRecords()
@@ -31,22 +36,30 @@ func (a *App) pickerRecords(opts PickerSortOptions) ([]snapshot.Record, error) {
 		return nil, errNoSavedSessions
 	}
 
-	mergeLastAttached(records, a.tmux.SessionsLastAttached())
+	mergeLastAttached(records, a.tmux.SessionsLastAttached(), a.currentServerID())
 
 	picker.SortSessionRecords(records, opts.Session)
 
 	return records, nil
 }
 
-func mergeLastAttached(records []snapshot.Record, attached map[string]time.Time) {
+func mergeLastAttached(
+	records []snapshot.Record,
+	attached map[string]time.Time,
+	currentServerID string,
+) {
 	if len(attached) == 0 {
 		return
 	}
 
-	for i := range records {
-		when, ok := attached[records[i].SessionName]
-		if ok && when.After(records[i].LastAccessed) {
-			records[i].LastAccessed = when
+	for index := range records {
+		if recordServerID(records[index]) != currentServerID {
+			continue
+		}
+
+		when, ok := attached[records[index].SessionName]
+		if ok && when.After(records[index].LastAccessed) {
+			records[index].LastAccessed = when
 		}
 	}
 }
@@ -67,23 +80,31 @@ func (a *App) pickerSessions(opts PickerSortOptions) ([]picker.Session, error) {
 		live[name] = struct{}{}
 	}
 
+	currentID := a.currentServerID()
 	sessions := make([]picker.Session, 0, len(records))
 	statusRegistry := a.integrations.Scope()
 
 	for _, rec := range records {
-		snap, err := a.pickerSnapshot(rec)
+		serverID := recordServerID(rec)
+		foreign := serverID != currentID
+
+		snap, err := a.pickerSnapshot(serverID, rec)
 		if err != nil {
 			log.Printf("picker: skip session %s: %v", rec.SessionName, err)
 
 			continue
 		}
 
-		_, restored := live[rec.SessionName]
+		_, liveHere := live[rec.SessionName]
+		restored := !foreign && liveHere
 
 		session := picker.Session{
 			Record:   rec,
 			Windows:  snap.Windows,
 			Restored: restored,
+			ServerID: serverID,
+			Foreign:  foreign,
+			Label:    store.ServerLabel(rec.ServerSocket),
 		}
 
 		if restored {
@@ -96,15 +117,21 @@ func (a *App) pickerSessions(opts PickerSortOptions) ([]picker.Session, error) {
 	return sessions, nil
 }
 
-func (a *App) pickerSnapshot(record snapshot.Record) (snapshot.SessionSnapshot, error) {
+func (a *App) pickerSnapshot(
+	serverID string,
+	record snapshot.Record,
+) (snapshot.SessionSnapshot, error) {
+	cacheKey := serverID + "/" + record.SessionName
+
 	a.pickerCacheMu.Lock()
-	cached, ok := a.pickerCache[record.SessionName]
+	cached, ok := a.pickerCache[cacheKey]
 	if ok && cached.file == record.File && cached.capturedAt.Equal(record.CapturedAt) {
 		a.pickerCacheMu.Unlock()
 
 		return cached.snapshot, nil
 	}
 	key := pickerCacheKey{
+		serverID:    serverID,
 		sessionName: record.SessionName,
 		file:        record.File,
 		capturedAt:  record.CapturedAt,
@@ -124,13 +151,11 @@ func (a *App) pickerSnapshot(record snapshot.Record) (snapshot.SessionSnapshot, 
 	a.pickerCacheMisses++
 	a.pickerCacheMu.Unlock()
 
-	snap, err := a.store.LoadSessionMetadata(record.SessionName)
-	if err != nil {
-		err = fmt.Errorf("load picker snapshot: %w", err)
-	}
+	snap, err := a.loadPickerSnapshotRecord(serverID, record)
+
 	a.pickerCacheMu.Lock()
 	if err == nil {
-		a.pickerCache[record.SessionName] = cachedPickerSnapshot{
+		a.pickerCache[cacheKey] = cachedPickerSnapshot{
 			capturedAt: record.CapturedAt,
 			file:       record.File,
 			snapshot:   snap,
@@ -142,7 +167,24 @@ func (a *App) pickerSnapshot(record snapshot.Record) (snapshot.SessionSnapshot, 
 	close(load.done)
 	a.pickerCacheMu.Unlock()
 
-	return snap, err
+	return load.snapshot, load.err
+}
+
+func (a *App) loadPickerSnapshotRecord(
+	serverID string,
+	record snapshot.Record,
+) (snapshot.SessionSnapshot, error) {
+	storage, err := a.targetStore(serverID)
+	if err != nil {
+		return snapshot.SessionSnapshot{}, fmt.Errorf("resolve session server: %w", err)
+	}
+
+	snap, err := storage.LoadSessionMetadata(record.SessionName)
+	if err != nil {
+		return snapshot.SessionSnapshot{}, fmt.Errorf("load picker snapshot: %w", err)
+	}
+
+	return snap, nil
 }
 
 func windowStatuses(
@@ -306,10 +348,10 @@ func (a *App) SelectWithTUI() (string, error) {
 	return target.SessionName, nil
 }
 
-func (a *App) SelectQuickSessionWithTUI(initialOffset int) (string, error) {
+func (a *App) SelectQuickSessionWithTUI(initialOffset int) (picker.QuickSession, error) {
 	sessions, err := a.quickPickerSessions()
 	if err != nil {
-		return "", err
+		return picker.QuickSession{}, err
 	}
 
 	session, err := picker.ChooseQuickSession(
@@ -317,10 +359,10 @@ func (a *App) SelectQuickSessionWithTUI(initialOffset int) (string, error) {
 		a.cfg.Theme,
 		a.cfg.SessionPicker.NavigationModifiers,
 		initialOffset,
-		func() map[string]bool { return a.quickWorkingSessions(sessions) },
+		func() map[string]picker.QuickSession { return a.quickWorkingSessions(sessions) },
 	)
 	if err != nil {
-		return "", fmt.Errorf("choose quick session: %w", err)
+		return picker.QuickSession{}, fmt.Errorf("choose quick session: %w", err)
 	}
 
 	return session, nil
@@ -337,39 +379,48 @@ func (a *App) quickPickerSessions() ([]picker.QuickSession, error) {
 		return nil, fmt.Errorf("list sessions: %w", err)
 	}
 
+	currentID := a.currentServerID()
 	attached := a.tmux.SessionsLastAttached()
-	mergeLastAttached(records, attached)
-	byName := make(map[string]struct{}, len(records)+len(liveSessions))
+	mergeLastAttached(records, attached, currentID)
+
+	byKey := make(map[string]struct{}, len(records)+len(liveSessions))
 	live := make(map[string]struct{}, len(liveSessions))
 	for index := range records {
-		byName[records[index].SessionName] = struct{}{}
+		byKey[recordServerID(records[index])+"/"+records[index].SessionName] = struct{}{}
 	}
 	for _, name := range liveSessions {
 		live[name] = struct{}{}
-		if _, ok := byName[name]; ok {
+		if _, ok := byKey[currentID+"/"+name]; ok {
 			continue
 		}
 
 		records = append(records, snapshot.Record{
 			SessionName:  name,
+			ServerSocket: a.serverSocket,
 			File:         "",
 			CapturedAt:   time.Time{},
 			LastAccessed: attached[name],
 			Windows:      0,
 			Panes:        0,
 		})
-		byName[name] = struct{}{}
+		byKey[currentID+"/"+name] = struct{}{}
 	}
-	sortQuickSessionRecords(records, live)
+	sortQuickSessionRecords(records, currentID, live)
 
 	current, _ := a.tmux.CurrentSession()
 	sessions := make([]picker.QuickSession, 0, len(records))
 	for _, record := range records {
-		_, restored := live[record.SessionName]
+		serverID := recordServerID(record)
+		foreign := serverID != currentID
+		_, liveHere := live[record.SessionName]
+		restored := !foreign && liveHere
 		sessions = append(sessions, picker.QuickSession{
 			Name:     record.SessionName,
+			ServerID: serverID,
+			Label:    store.ServerLabel(record.ServerSocket),
+			Foreign:  foreign,
 			Restored: restored,
-			Current:  record.SessionName == current,
+			Current:  !foreign && record.SessionName == current,
 			Working:  false,
 		})
 	}
@@ -377,29 +428,45 @@ func (a *App) quickPickerSessions() ([]picker.QuickSession, error) {
 	return sessions, nil
 }
 
-func (a *App) quickWorkingSessions(sessions []picker.QuickSession) map[string]bool {
-	working := make(map[string]bool)
+func (a *App) quickWorkingSessions(
+	sessions []picker.QuickSession,
+) map[string]picker.QuickSession {
+	working := make(map[string]picker.QuickSession)
 	registry := a.integrations.Scope()
 	statuses := parallelMap(
 		sessions,
 		quickStatusWorkerLimit,
-		func(session picker.QuickSession) bool {
-			return a.sessionHasWorkingAgent(registry, session.Name, session.Restored)
+		func(session picker.QuickSession) picker.QuickSession {
+			if !session.Restored {
+				return picker.QuickSession{}
+			}
+			if a.sessionHasWorkingAgent(registry, session) {
+				return session
+			}
+
+			return picker.QuickSession{}
 		},
 	)
 	for index, isWorking := range statuses {
-		if isWorking {
-			working[sessions[index].Name] = true
+		if isWorking.Name != "" {
+			working[isWorking.ServerID+"/"+isWorking.Name] = sessions[index]
 		}
 	}
 
 	return working
 }
 
-func sortQuickSessionRecords(records []snapshot.Record, live map[string]struct{}) {
+func sortQuickSessionRecords(
+	records []snapshot.Record,
+	currentID string,
+	live map[string]struct{},
+) {
 	sort.Slice(records, func(indexI, indexJ int) bool {
-		_, liveI := live[records[indexI].SessionName]
-		_, liveJ := live[records[indexJ].SessionName]
+		idI, idJ := recordServerID(records[indexI]), recordServerID(records[indexJ])
+		_, liveHereI := live[records[indexI].SessionName]
+		_, liveHereJ := live[records[indexJ].SessionName]
+		liveI := idI == currentID && liveHereI
+		liveJ := idJ == currentID && liveHereJ
 		if liveI != liveJ {
 			return liveI
 		}
@@ -409,6 +476,9 @@ func sortQuickSessionRecords(records []snapshot.Record, live map[string]struct{}
 		if !records[indexI].CapturedAt.Equal(records[indexJ].CapturedAt) {
 			return records[indexI].CapturedAt.After(records[indexJ].CapturedAt)
 		}
+		if idI != idJ {
+			return records[indexI].ServerSocket < records[indexJ].ServerSocket
+		}
 
 		return records[indexI].SessionName < records[indexJ].SessionName
 	})
@@ -416,14 +486,18 @@ func sortQuickSessionRecords(records []snapshot.Record, live map[string]struct{}
 
 func (a *App) sessionHasWorkingAgent(
 	registry *integration.Registry,
-	session string,
-	restored bool,
+	session picker.QuickSession,
 ) bool {
-	if !restored {
+	if !session.Restored {
 		return false
 	}
 
-	snap, err := a.store.LoadSessionMetadata(session)
+	storage, err := a.targetStore(session.ServerID)
+	if err != nil {
+		return false
+	}
+
+	snap, err := storage.LoadSessionMetadata(session.Name)
 	if err != nil {
 		return false
 	}
@@ -442,15 +516,20 @@ func (a *App) sessionHasWorkingAgent(
 	return false
 }
 
-func (a *App) OpenQuickSession(session string) error {
-	target := PickerTarget{SessionName: session}
-	if a.tmux.SessionExists(strings.TrimSpace(session)) {
+func (a *App) OpenQuickSession(session picker.QuickSession) error {
+	target := PickerTarget{SessionName: session.Name, ServerID: session.ServerID}
+	if a.tmux.SessionExists(strings.TrimSpace(session.Name)) {
 		err := a.handoffToTarget(target, true, false)
 		if err != nil {
 			return err
 		}
 
-		err = a.store.MarkSessionAccessed(session, time.Now().UTC())
+		storage, err := a.targetStore(session.ServerID)
+		if err != nil {
+			return fmt.Errorf("resolve session server: %w", err)
+		}
+
+		err = storage.MarkSessionAccessed(session.Name, time.Now().UTC())
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("mark session accessed: %w", err)
 		}
@@ -461,22 +540,22 @@ func (a *App) OpenQuickSession(session string) error {
 	return a.RestoreTargetInteractive(target)
 }
 
-func (a *App) SelectWithFZF() (string, error) {
+func (a *App) SelectWithFZF() (PickerTarget, error) {
 	return a.SelectWithFZFSorted(DefaultPickerSortOptions())
 }
 
-func (a *App) SelectWithFZFSorted(opts PickerSortOptions) (string, error) {
+func (a *App) SelectWithFZFSorted(opts PickerSortOptions) (PickerTarget, error) {
 	records, err := a.pickerRecords(opts)
 	if err != nil {
-		return "", err
+		return PickerTarget{}, err
 	}
 
-	session, err := picker.ChooseSessionFZF(records)
+	target, err := picker.ChooseSessionFZF(records)
 	if err != nil {
-		return "", fmt.Errorf("choose session fzf: %w", err)
+		return PickerTarget{}, fmt.Errorf("choose session fzf: %w", err)
 	}
 
-	return session, nil
+	return target, nil
 }
 
 func (a *App) SelectTargetWithFZFSorted(opts PickerSortOptions) (PickerTarget, error) {

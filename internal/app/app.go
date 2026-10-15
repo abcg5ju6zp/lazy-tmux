@@ -74,6 +74,7 @@ type tmuxClient interface {
 type App struct {
 	cfg               config.Config
 	store             *store.Store
+	serverSocket      string
 	tmux              tmuxClient
 	integrations      *integration.Registry
 	saveAllFn         func() error
@@ -90,6 +91,7 @@ type cachedPickerSnapshot struct {
 }
 
 type pickerCacheKey struct {
+	serverID    string
 	sessionName string
 	file        string
 	capturedAt  time.Time
@@ -110,9 +112,12 @@ func New(cfg config.Config) *App {
 	registry := buildRegistry(cfg.Integrations, ClaudeStatusDir(cfg.DataDir))
 	client.SetRestoreResolver(registry)
 
+	serverSocket := client.ServerIdentity()
+
 	return &App{
 		cfg:               cfg,
-		store:             store.New(cfg.DataDir),
+		store:             store.NewForServer(cfg.DataDir, serverSocket),
+		serverSocket:      serverSocket,
 		tmux:              client,
 		integrations:      registry,
 		pickerCacheMu:     sync.Mutex{},
@@ -120,6 +125,11 @@ func New(cfg config.Config) *App {
 		pickerLoads:       make(map[pickerCacheKey]*pickerSnapshotLoad),
 		pickerCacheMisses: 0,
 	}
+}
+
+// ServerSocket returns the tmux server socket path this app is bound to.
+func (a *App) ServerSocket() string {
+	return a.serverSocket
 }
 
 func ClaudeStatusDir(dataDir string) string {
@@ -200,16 +210,7 @@ func (a *App) RestoreTarget(target PickerTarget, switchClient bool) error {
 func (a *App) Bootstrap(session string) error {
 	target := strings.TrimSpace(session)
 	if target == "" || target == "last" {
-		rec, err := a.store.LatestRecord()
-		if err != nil {
-			if os.IsNotExist(err) {
-				return nil
-			}
-
-			return fmt.Errorf("get latest record: %w", err)
-		}
-
-		target = rec.SessionName
+		return a.bootstrapLatest()
 	}
 
 	return a.Restore(target, true)
@@ -222,6 +223,103 @@ func (a *App) ListRecords() ([]snapshot.Record, error) {
 	}
 
 	return records, nil
+}
+
+func (a *App) bootstrapLatest() error {
+	rec, err := a.store.LatestRecord()
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("get latest record: %w", err)
+		}
+
+		// Upgraded single-server installs may still have their snapshots
+		// parked in the selectable legacy namespace.
+		rec, err = a.latestLegacyRecord()
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("get latest legacy record: %w", err)
+		}
+	}
+
+	return a.RestoreTarget(PickerTarget{
+		SessionName: rec.SessionName,
+		ServerID:    store.ServerID(rec.ServerSocket),
+	}, true)
+}
+
+func (a *App) latestLegacyRecord() (snapshot.Record, error) {
+	legacy := a.legacyStore()
+	if legacy == nil {
+		return snapshot.Record{}, os.ErrNotExist
+	}
+
+	rec, err := legacy.LatestRecord()
+	if err != nil {
+		return snapshot.Record{}, fmt.Errorf("get latest legacy record: %w", err)
+	}
+
+	return rec, nil
+}
+
+func (a *App) currentServerID() string {
+	return store.ServerID(a.serverSocket)
+}
+
+// targetStore resolves the namespace store of a picker target. An empty
+// server id addresses the command's current server.
+func (a *App) targetStore(serverID string) (*store.Store, error) {
+	serverID = strings.TrimSpace(serverID)
+	if serverID == "" || serverID == a.currentServerID() {
+		return a.store, nil
+	}
+
+	target, err := a.store.ForServerID(serverID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve session namespace %q: %w", serverID, err)
+	}
+
+	return target, nil
+}
+
+// legacyStore returns the selectable legacy namespace store, or nil when the
+// data directory has no legacy records at all.
+func (a *App) legacyStore() *store.Store {
+	legacy, err := a.store.ForServerID(store.LegacyServerID)
+	if err != nil {
+		return nil
+	}
+
+	return legacy
+}
+
+// storeForName resolves a bare session name given on the command line: current
+// server first, then selectable legacy records. Foreign servers are never
+// chosen implicitly when names collide.
+func (a *App) storeForName(name string) (*store.Store, error) {
+	exists, err := a.store.SessionExists(name)
+	if err != nil {
+		return nil, fmt.Errorf("check current namespace: %w", err)
+	}
+	if exists {
+		return a.store, nil
+	}
+
+	legacy := a.legacyStore()
+	if legacy == nil {
+		return a.store, nil
+	}
+
+	legacyExists, err := legacy.SessionExists(name)
+	if err != nil {
+		return nil, fmt.Errorf("check legacy namespace: %w", err)
+	}
+	if legacyExists {
+		return legacy, nil
+	}
+
+	return a.store, nil
 }
 
 func (a *App) saveSession(session string, integrationScope *integration.Registry) error {
@@ -250,7 +348,12 @@ func (a *App) restoreSessionForTarget(ctx context.Context, target PickerTarget) 
 		return errSessionNameEmpty
 	}
 
-	snap, err := a.store.LoadSession(session)
+	storage, err := a.restoreStorage(target, session)
+	if err != nil {
+		return err
+	}
+
+	snap, err := storage.LoadSession(session)
 	if err != nil {
 		return fmt.Errorf("load session: %w", err)
 	}
@@ -260,12 +363,33 @@ func (a *App) restoreSessionForTarget(ctx context.Context, target PickerTarget) 
 		return fmt.Errorf("restore session: %w", err)
 	}
 
-	err = a.store.MarkSessionAccessed(session, time.Now().UTC())
+	err = storage.MarkSessionAccessed(session, time.Now().UTC())
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("mark session accessed: %w", err)
 	}
 
 	return nil
+}
+
+// restoreStorage selects the namespace a restore reads from. Picker targets
+// address an explicit server namespace; bare command-line names resolve
+// current-server first and legacy snapshots second.
+func (a *App) restoreStorage(target PickerTarget, session string) (*store.Store, error) {
+	if strings.TrimSpace(target.ServerID) != "" {
+		storage, err := a.targetStore(target.ServerID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve session server: %w", err)
+		}
+
+		return storage, nil
+	}
+
+	storage, err := a.storeForName(session)
+	if err != nil {
+		return nil, fmt.Errorf("resolve session storage: %w", err)
+	}
+
+	return storage, nil
 }
 
 func (a *App) handoffToTarget(

@@ -20,22 +20,22 @@ type quickPickerModel struct {
 	cursor              int
 	width               int
 	height              int
-	selected            string
+	selected            QuickSession
 	cancelled           bool
 	spinnerFrame        int
 	navigationModifiers map[string]struct{}
-	loadWorking         func() map[string]bool
+	loadWorking         func() map[string]QuickSession
 }
 
 const quickChromeRows = 3
 
-type quickStatusesLoadedMsg map[string]bool
+type quickStatusesLoadedMsg map[string]QuickSession
 
 func newQuickPickerModel(
 	sessions []QuickSession,
 	themeName string,
 	navigationModifiers []string,
-	workingLoaders ...func() map[string]bool,
+	workingLoaders ...func() map[string]QuickSession,
 ) quickPickerModel {
 	if themeName != themeLight {
 		themeName = themeDark
@@ -49,7 +49,7 @@ func newQuickPickerModel(
 	inputStyles.Blurred.Prompt = theme.prompt
 	input.SetStyles(inputStyles)
 	input.Focus()
-	var loadWorking func() map[string]bool
+	var loadWorking func() map[string]QuickSession
 	if len(workingLoaders) > 0 {
 		loadWorking = workingLoaders[0]
 	}
@@ -62,7 +62,7 @@ func newQuickPickerModel(
 		cursor:              0,
 		width:               0,
 		height:              0,
-		selected:            "",
+		selected:            QuickSession{},
 		cancelled:           false,
 		spinnerFrame:        0,
 		navigationModifiers: modifierSet(navigationModifiers),
@@ -117,7 +117,7 @@ func (m quickPickerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case keyEnter:
 			if len(m.visible) > 0 {
-				m.selected = m.visible[m.cursor].Name
+				m.selected = m.visible[m.cursor]
 
 				return m, tea.Quit
 			}
@@ -134,7 +134,7 @@ func (m quickPickerModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func loadQuickStatuses(loader func() map[string]bool) tea.Cmd {
+func loadQuickStatuses(loader func() map[string]QuickSession) tea.Cmd {
 	return func() tea.Msg { return quickStatusesLoadedMsg(loader()) }
 }
 
@@ -177,15 +177,23 @@ func (m quickPickerModel) View() tea.View {
 	return view
 }
 
-func (m quickPickerModel) withWorkingStatuses(statuses map[string]bool) quickPickerModel {
+func (m quickPickerModel) withWorkingStatuses(statuses map[string]QuickSession) quickPickerModel {
 	for index := range m.sessions {
-		m.sessions[index].Working = statuses[m.sessions[index].Name]
+		if _, ok := statuses[quickKey(m.sessions[index])]; ok {
+			m.sessions[index].Working = true
+		}
 	}
 	for index := range m.visible {
-		m.visible[index].Working = statuses[m.visible[index].Name]
+		if _, ok := statuses[quickKey(m.visible[index])]; ok {
+			m.visible[index].Working = true
+		}
 	}
 
 	return m
+}
+
+func quickKey(session QuickSession) string {
+	return session.ServerID + "\x00" + session.Name
 }
 
 func (m quickPickerModel) navigationDelta(msg tea.KeyPressMsg) (int, bool) {
@@ -252,7 +260,7 @@ func (m quickPickerModel) visibleRange() (int, int) {
 
 func (m quickPickerModel) renderSession(index, width int) string {
 	session := m.visible[index]
-	state := "○"
+	state := "○" // foreign/offline snapshots are never live on this server
 	if session.Working {
 		state = statusGlyphFrame(StatusWorking, m.spinnerFrame)
 	} else if session.Restored {
@@ -260,6 +268,14 @@ func (m quickPickerModel) renderSession(index, width int) string {
 	}
 
 	name := session.Name
+	if session.Foreign {
+		label := strings.TrimSpace(session.Label)
+		if label == "" {
+			label = "offline"
+		}
+
+		name += "  @" + label
+	}
 	if session.Current {
 		name += "  ←"
 	}
@@ -360,10 +376,10 @@ func ChooseQuickSession(
 	themeName string,
 	navigationModifiers []string,
 	initialOffset int,
-	loadWorking func() map[string]bool,
-) (string, error) {
+	loadWorking func() map[string]QuickSession,
+) (QuickSession, error) {
 	if tuiDisabled() {
-		return "", errTUIDisabled
+		return QuickSession{}, errTUIDisabled
 	}
 
 	model := newQuickPickerModel(
@@ -376,18 +392,18 @@ func ChooseQuickSession(
 	runner := newQuickPickerRunner(model)
 	finalModel, err := runner.Run()
 	if err != nil {
-		return "", fmt.Errorf("run quick picker: %w", err)
+		return QuickSession{}, fmt.Errorf("run quick picker: %w", err)
 	}
 
 	result, ok := finalModel.(quickPickerModel)
 	if !ok {
-		return "", errUnexpectedModel
+		return QuickSession{}, errUnexpectedModel
 	}
 	if result.cancelled {
-		return "", errSelectionCanceled
+		return QuickSession{}, errSelectionCanceled
 	}
-	if result.selected == "" {
-		return "", errNoSessionSelected
+	if strings.TrimSpace(result.selected.Name) == "" {
+		return QuickSession{}, errNoSessionSelected
 	}
 
 	return result.selected, nil

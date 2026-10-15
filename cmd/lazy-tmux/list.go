@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/alchemmist/lazy-tmux/internal/app"
+	"github.com/alchemmist/lazy-tmux/internal/snapshot"
+	"github.com/alchemmist/lazy-tmux/internal/store"
 )
 
 func runList(args []string, stdout, stderr io.Writer) int {
@@ -52,18 +54,32 @@ func runList(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	withServer := multipleServers(recs)
+
 	for _, rec := range recs {
-		_, _ = fmt.Fprintf(
-			stdout,
-			"%s\t%s\t%dw/%dp\n",
+		line := fmt.Sprintf(
+			"%s\t%s\t%dw/%dp",
 			rec.SessionName,
 			rec.CapturedAt.Local().Format(time.RFC3339),
 			rec.Windows,
 			rec.Panes,
 		)
+		if withServer {
+			line += "\t@" + store.ServerLabel(rec.ServerSocket)
+		}
+		_, _ = fmt.Fprintln(stdout, line)
 	}
 
 	return 0
+}
+
+func multipleServers(records []snapshot.Record) bool {
+	seen := make(map[string]struct{}, len(records))
+	for _, rec := range records {
+		seen[rec.ServerSocket] = struct{}{}
+	}
+
+	return len(seen) > 1
 }
 
 func listHelp(w io.Writer) {

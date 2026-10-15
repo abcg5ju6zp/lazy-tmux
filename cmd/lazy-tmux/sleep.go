@@ -60,7 +60,7 @@ func runSleep(args []string, stdout, stderr io.Writer) int {
 
 	a := app.New(cfg)
 
-	err = a.Sleep(strings.TrimSpace(*session))
+	err = a.Sleep("", strings.TrimSpace(*session))
 	if err != nil {
 		writeErr(stderr, fmt.Errorf("sleep session: %w", err))
 

@@ -59,11 +59,13 @@ func makeSession(name string, restored bool, windowNames ...string) Session {
 }
 
 type deletedWindowCall struct {
+	server  string
 	session string
 	index   int
 }
 
 type recordingActions struct {
+	deletedServer      string
 	deletedWindow      [2]int
 	deletedWindowS     string
 	deletedWindowCalls []deletedWindowCall
@@ -79,28 +81,35 @@ type recordingActions struct {
 
 func (r *recordingActions) toActions(sessions []Session) Actions {
 	return Actions{
-		DeleteWindow: func(s string, idx int) error {
+		DeleteWindow: func(serverID, s string, idx int) error {
 			if r.failDelete {
 				return errBoom
 			}
 
+			r.deletedServer = serverID
 			r.deletedWindowS = s
 			r.deletedWindow = [2]int{idx, idx}
-			r.deletedWindowCalls = append(r.deletedWindowCalls, deletedWindowCall{s, idx})
+			r.deletedWindowCalls = append(
+				r.deletedWindowCalls,
+				deletedWindowCall{server: serverID, session: s, index: idx},
+			)
 
 			return nil
 		},
-		DeleteSession: func(s string) error {
+		DeleteSession: func(serverID, s string) error {
+			r.deletedServer = serverID
 			r.deletedSession = s
 
 			return nil
 		},
-		RenameWindow: func(_ string, _ int, n string) error {
+		RenameWindow: func(serverID, _ string, _ int, n string) error {
+			r.deletedServer = serverID
 			r.renamedWindow = n
 
 			return nil
 		},
-		RenameSession: func(_, n string) error {
+		RenameSession: func(serverID, _, n string) error {
+			r.deletedServer = serverID
 			r.renamedSession = n
 
 			return nil
@@ -110,17 +119,20 @@ func (r *recordingActions) toActions(sessions []Session) Actions {
 
 			return nil
 		},
-		NewWindow: func(s, n string) error {
+		NewWindow: func(serverID, s, n string) error {
+			r.deletedServer = serverID
 			r.newWindow = [2]string{s, n}
 
 			return nil
 		},
-		Wakeup: func(s string) error {
+		Wakeup: func(serverID, s string) error {
+			r.deletedServer = serverID
 			r.wokeUp = s
 
 			return nil
 		},
-		Sleep: func(s string) error {
+		Sleep: func(serverID, s string) error {
+			r.deletedServer = serverID
 			r.slept = s
 
 			return nil

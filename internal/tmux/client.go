@@ -299,17 +299,40 @@ func (client *Client) CurrentSession() (string, error) {
 }
 
 func (client *Client) SocketPath() string {
+	return client.ServerIdentity()
+}
+
+// ServerIdentity returns the socket path that identifies the tmux server the
+// client talks to. The live server is queried first; when no server can be
+// reached the identity is derived from $TMUX or tmux's default socket path so
+// a fresh server that starts later lands in the same namespace.
+func (client *Client) ServerIdentity() string {
 	out, err := client.Output("display-message", "-p", "#{socket_path}")
-	if err != nil {
-		return "default"
+	if err == nil {
+		if socket := strings.TrimSpace(out); socket != "" && socket != "default" {
+			return filepath.Clean(socket)
+		}
 	}
 
-	v := strings.TrimSpace(out)
-	if v == "" {
-		return "default"
+	return DefaultSocketPath()
+}
+
+// DefaultSocketPath mirrors tmux's own socket resolution without contacting a
+// server: $TMUX (set inside sessions), then $TMUX_TMPDIR/tmux-UID/default,
+// then /tmp/tmux-UID/default. tmux itself ignores $TMPDIR here.
+func DefaultSocketPath() string {
+	if tmuxEnv := strings.TrimSpace(os.Getenv("TMUX")); tmuxEnv != "" {
+		if socket := strings.TrimSpace(strings.SplitN(tmuxEnv, ",", 2)[0]); socket != "" {
+			return filepath.Clean(socket)
+		}
 	}
 
-	return v
+	dir := strings.TrimSpace(os.Getenv("TMUX_TMPDIR"))
+	if dir == "" {
+		dir = "/tmp"
+	}
+
+	return filepath.Clean(filepath.Join(dir, fmt.Sprintf("tmux-%d", os.Getuid()), "default"))
 }
 
 func (client *Client) SwitchClient(session string) error {
@@ -447,13 +470,31 @@ func (client *Client) CaptureSession(name string) (snapshot.SessionSnapshot, err
 	currentWin, currentPane := currentWindowPane(windows)
 
 	return snapshot.SessionSnapshot{
-		Version:     snapshot.FormatVersion,
-		SessionName: name,
-		CapturedAt:  nowUTC(),
-		CurrentWin:  currentWin,
-		CurrentPane: currentPane,
-		Windows:     windows,
+		Version:      snapshot.FormatVersion,
+		SessionName:  name,
+		ServerSocket: capturedSocketPath(paneOutput),
+		CapturedAt:   nowUTC(),
+		CurrentWin:   currentWin,
+		CurrentPane:  currentPane,
+		Windows:      windows,
 	}, nil
+}
+
+// capturedSocketPath pulls the server socket reported by every captured pane,
+// so the snapshot is stamped even though saving never runs an extra tmux call.
+func capturedSocketPath(paneOutput string) string {
+	for _, line := range splitLines(paneOutput) {
+		parts := splitFieldsN(line, capturePaneLineFields)
+		if len(parts) != capturePaneLineFields {
+			continue
+		}
+
+		if socket := strings.TrimSpace(parts[11]); socket != "" {
+			return socket
+		}
+	}
+
+	return ""
 }
 
 func parseCapturedPanes(output string, processes processSnapshot) []snapshot.Window {

@@ -160,11 +160,13 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 		t.Fatalf("save: %v", err)
 	}
 
-	if _, err := os.Stat(filepath.Join(dir, "sessions", "alpha.json")); err != nil {
+	if _, err := os.Stat(
+		filepath.Join(dir, LegacyServerID, sessionsDirName, "alpha.json"),
+	); err != nil {
 		t.Fatalf("session file not written: %v", err)
 	}
 
-	if _, err := os.Stat(filepath.Join(dir, "index.json")); err != nil {
+	if _, err := os.Stat(filepath.Join(dir, LegacyServerID, indexFileName)); err != nil {
 		t.Fatalf("index file not written: %v", err)
 	}
 
@@ -370,7 +372,7 @@ func TestSessionNameSanitized(t *testing.T) {
 		t.Fatalf("save: %v", err)
 	}
 
-	want := filepath.Join(dir, "sessions", "my_weird_name_1.json")
+	want := filepath.Join(dir, LegacyServerID, sessionsDirName, "my_weird_name_1.json")
 	if _, err := os.Stat(want); err != nil {
 		t.Fatalf("expected sanitized file %s: %v", want, err)
 	}
@@ -393,7 +395,7 @@ func TestScrollbackPersistAndHydrate(t *testing.T) {
 		t.Fatalf("save: %v", err)
 	}
 
-	logPath := filepath.Join(dir, "scrollback", "logs", "w1_p0.log")
+	logPath := filepath.Join(dir, LegacyServerID, scrollbackDir, "logs", "w1_p0.log")
 	if _, err := os.Stat(logPath); err != nil {
 		t.Fatalf("scrollback file not written: %v", err)
 	}
@@ -433,7 +435,7 @@ func TestSessionPath(t *testing.T) {
 		t.Fatalf("session path: %v", err)
 	}
 
-	if p != filepath.Join("/base", "sessions", "name.json") {
+	if p != filepath.Join("/base", LegacyServerID, sessionsDirName, "name.json") {
 		t.Fatalf("unexpected session path: %s", p)
 	}
 

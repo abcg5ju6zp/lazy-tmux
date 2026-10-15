@@ -50,19 +50,21 @@ func TestFuzzyScorePrioritizesStrongMatches(t *testing.T) {
 func TestSessionStateIcon(t *testing.T) {
 	t.Parallel()
 
-	restored := sessionStateIcon(true)
-	notRestored := sessionStateIcon(false)
+	restored := sessionStateIcon(true, false)
+	notRestored := sessionStateIcon(false, false)
+	foreign := sessionStateIcon(false, true)
 
-	if restored == "" || notRestored == "" {
+	if restored == "" || foreign == "" {
 		t.Fatalf(
-			"both state icons should be non-empty: restored=%q notRestored=%q",
+			"restored/foreign icons should be non-empty: restored=%q foreign=%q",
 			restored,
-			notRestored,
+			foreign,
 		)
 	}
 
-	if restored == notRestored {
-		t.Fatalf("restored and not-restored icons should differ, both %q", restored)
+	if restored == notRestored || restored == foreign {
+		t.Fatalf("restored icon should differ, restored=%q notRestored=%q foreign=%q",
+			restored, notRestored, foreign)
 	}
 }
 

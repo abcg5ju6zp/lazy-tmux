@@ -36,11 +36,11 @@ func filteredTreeRows(
 		sess := match.data
 
 		rows = append(rows, pickerRow{
-			target:     Target{SessionName: sess.Record.SessionName},
-			item:       sess.Record.SessionName,
+			target:     Target{SessionName: sess.Record.SessionName, ServerID: sess.ServerID},
+			item:       withForeignMarker(sess.Record.SessionName, foreignLabel(sess)),
 			captured:   relativeTime(sess.Record.CapturedAt, time.Now()),
 			wins:       strconv.Itoa(sess.Record.Windows),
-			state:      sessionStateIcon(sess.Restored),
+			state:      sessionStateIcon(sess.Restored, sess.Foreign),
 			selectable: false,
 		})
 
@@ -147,14 +147,46 @@ func windowRow(sess Session, win snapshot.Window, branch string, spinnerFrame in
 	status := sess.Statuses[win.Index]
 
 	return pickerRow{
-		target:     Target{SessionName: sess.Record.SessionName, WindowIndex: &windowIdx},
-		item:       fmt.Sprintf("  %s [%d] %s", branch, win.Index, win.Name),
+		target: Target{
+			SessionName: sess.Record.SessionName,
+			WindowIndex: &windowIdx,
+			ServerID:    sess.ServerID,
+		},
+		item: withForeignMarker(
+			fmt.Sprintf("  %s [%d] %s", branch, win.Index, win.Name),
+			foreignLabel(sess),
+		),
 		state:      statusGlyphFrame(status, spinnerFrame),
 		status:     status,
 		cmd:        windowPreviewCommand(win),
 		windowName: win.Name,
 		selectable: true,
 	}
+}
+
+// withForeignMarker appends the owning server marker ("@socket") to a row so
+// snapshots of other tmux servers stay recognizable in the selector.
+func withForeignMarker(item, marker string) string {
+	if marker == "" {
+		return item
+	}
+
+	return item + "  " + marker
+}
+
+// foreignLabel returns the dimmed server marker rendered for records owned by
+// another tmux server (or left behind by a pre-namespace version).
+func foreignLabel(sess Session) string {
+	if !sess.Foreign {
+		return ""
+	}
+
+	label := strings.TrimSpace(sess.Label)
+	if label == "" {
+		label = "offline"
+	}
+
+	return "@" + label
 }
 
 func (m pickerModel) modeSessions() []Session {
@@ -255,12 +287,16 @@ func relativeTime(then, now time.Time) string {
 	}
 }
 
-func sessionStateIcon(restored bool) string {
-	if restored {
+func sessionStateIcon(restored, foreign bool) string {
+	switch {
+	case restored:
 		return "✓"
+	case foreign:
+		// Snapshot owned by a different (currently unreachable) tmux server.
+		return "○"
+	default:
+		return ""
 	}
-
-	return ""
 }
 
 func fuzzyMatch(query, target string) bool {

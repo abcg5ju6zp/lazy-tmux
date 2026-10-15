@@ -8,20 +8,36 @@ import (
 	"strings"
 
 	"github.com/alchemmist/lazy-tmux/internal/snapshot"
+	"github.com/alchemmist/lazy-tmux/internal/store"
 )
 
-func (a *App) DeleteWindow(session string, windowIndex int) error {
-	if a.tmux.SessionExists(session) {
-		handled, err := a.deleteLiveWindow(session, windowIndex)
+func (a *App) DeleteWindow(serverID, session string, windowIndex int) error {
+	storage, err := a.targetStore(serverID)
+	if err != nil {
+		return fmt.Errorf("resolve session server: %w", err)
+	}
+
+	if a.isCurrentServer(serverID) && a.tmux.SessionExists(session) {
+		handled, err := a.deleteLiveWindow(storage, session, windowIndex)
 		if handled {
 			return err
 		}
 	}
 
-	return a.deleteSnapshotWindow(session, windowIndex)
+	return a.deleteSnapshotWindow(storage, session, windowIndex)
 }
 
-func (a *App) deleteLiveWindow(session string, windowIndex int) (bool, error) {
+func (a *App) isCurrentServer(serverID string) bool {
+	serverID = strings.TrimSpace(serverID)
+
+	return serverID == "" || serverID == a.currentServerID()
+}
+
+func (a *App) deleteLiveWindow(
+	storage *store.Store,
+	session string,
+	windowIndex int,
+) (bool, error) {
 	err := a.tmux.KillWindow(session, windowIndex)
 	if err != nil {
 		var exitErr *exec.ExitError
@@ -33,7 +49,7 @@ func (a *App) deleteLiveWindow(session string, windowIndex int) (bool, error) {
 	}
 
 	if !a.tmux.SessionExists(session) {
-		err := a.store.DeleteSession(session)
+		err := storage.DeleteSession(session)
 		if err != nil {
 			return true, fmt.Errorf("delete session: %w", err)
 		}
@@ -41,11 +57,35 @@ func (a *App) deleteLiveWindow(session string, windowIndex int) (bool, error) {
 		return true, nil
 	}
 
-	return true, a.SaveSession(session)
+	return true, a.saveLiveSession(storage, session)
 }
 
-func (a *App) deleteSnapshotWindow(session string, windowIndex int) error {
-	snap, err := a.store.LoadSession(session)
+// saveLiveSession captures the current server's live session into the given
+// namespace store. Callers must only use the bound current-server store here.
+func (a *App) saveLiveSession(storage *store.Store, session string) error {
+	snap, err := a.tmux.CaptureSession(session)
+	if err != nil {
+		return fmt.Errorf("capture session: %w", err)
+	}
+	if a.cfg.Scrollback.Enabled {
+		a.captureShellScrollback(&snap)
+	}
+	a.integrations.Scope().Enrich(&snap)
+
+	err = storage.SaveSession(snap)
+	if err != nil {
+		return fmt.Errorf("save session: %w", err)
+	}
+
+	return nil
+}
+
+func (a *App) deleteSnapshotWindow(
+	storage *store.Store,
+	session string,
+	windowIndex int,
+) error {
+	snap, err := storage.LoadSession(session)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return fmt.Errorf("session %q not found: %w", session, os.ErrNotExist)
@@ -72,7 +112,7 @@ func (a *App) deleteSnapshotWindow(session string, windowIndex int) error {
 	}
 
 	if len(windows) == 0 {
-		err := a.store.DeleteSession(session)
+		err := storage.DeleteSession(session)
 		if err != nil {
 			return fmt.Errorf("delete session: %w", err)
 		}
@@ -82,7 +122,7 @@ func (a *App) deleteSnapshotWindow(session string, windowIndex int) error {
 
 	snap.Windows = windows
 
-	err = a.store.SaveSession(snap)
+	err = storage.SaveSession(snap)
 	if err != nil {
 		return fmt.Errorf("save session: %w", err)
 	}
@@ -90,12 +130,35 @@ func (a *App) deleteSnapshotWindow(session string, windowIndex int) error {
 	return nil
 }
 
-func (a *App) Forget(session string) error {
+// Forget removes a stored snapshot. With an empty server id the name is
+// resolved in the current server namespace and then in the legacy namespace;
+// snapshots of other servers must be addressed explicitly through the picker.
+func (a *App) Forget(serverID, session string) error {
 	if strings.TrimSpace(session) == "" {
 		return errSessionNameEmpty
 	}
 
-	err := a.store.DeleteSession(strings.TrimSpace(session))
+	session = strings.TrimSpace(session)
+
+	if strings.TrimSpace(serverID) == "" {
+		storage, err := a.storeForName(session)
+		if err != nil {
+			return fmt.Errorf("resolve session storage: %w", err)
+		}
+
+		return forgetFromStorage(storage, session)
+	}
+
+	storage, err := a.targetStore(serverID)
+	if err != nil {
+		return fmt.Errorf("resolve session server: %w", err)
+	}
+
+	return forgetFromStorage(storage, session)
+}
+
+func forgetFromStorage(storage *store.Store, session string) error {
+	err := storage.DeleteSession(session)
 	if err != nil {
 		return fmt.Errorf("delete session storage: %w", err)
 	}
@@ -103,15 +166,24 @@ func (a *App) Forget(session string) error {
 	return nil
 }
 
-func (a *App) DeleteSession(session string) error {
-	if a.tmux.SessionExists(session) {
+func (a *App) DeleteSession(serverID, session string) error {
+	session = strings.TrimSpace(session)
+	// Only the server that owns a live session may kill it. A foreign
+	// namespace record must never reach the current server's same-named
+	// session.
+	if a.isCurrentServer(serverID) && a.tmux.SessionExists(session) {
 		err := a.tmux.KillSession(session)
 		if err != nil {
 			return fmt.Errorf("kill session: %w", err)
 		}
 	}
 
-	err := a.store.DeleteSession(session)
+	storage, err := a.targetStore(serverID)
+	if err != nil {
+		return fmt.Errorf("resolve session server: %w", err)
+	}
+
+	err = storage.DeleteSession(session)
 	if err != nil {
 		return fmt.Errorf("delete session: %w", err)
 	}
@@ -119,19 +191,28 @@ func (a *App) DeleteSession(session string) error {
 	return nil
 }
 
-func (a *App) RenameWindow(session string, windowIndex int, name string) error {
+func (a *App) RenameWindow(
+	serverID, session string,
+	windowIndex int,
+	name string,
+) error {
 	if strings.TrimSpace(name) == "" {
 		return errWindowNameEmpty
 	}
 
-	if a.tmux.SessionExists(session) {
+	storage, err := a.targetStore(serverID)
+	if err != nil {
+		return fmt.Errorf("resolve session server: %w", err)
+	}
+
+	if a.isCurrentServer(serverID) && a.tmux.SessionExists(session) {
 		err := a.tmux.RenameWindow(session, windowIndex, name)
 		if err != nil {
 			return fmt.Errorf("rename window: %w", err)
 		}
 	}
 
-	snap, err := a.store.LoadSession(session)
+	snap, err := storage.LoadSession(session)
 	if err != nil {
 		return fmt.Errorf("load session: %w", err)
 	}
@@ -151,7 +232,7 @@ func (a *App) RenameWindow(session string, windowIndex int, name string) error {
 		return errWindowNotInSnapshot
 	}
 
-	err = a.store.SaveSession(snap)
+	err = storage.SaveSession(snap)
 	if err != nil {
 		return fmt.Errorf("save session: %w", err)
 	}
@@ -159,7 +240,7 @@ func (a *App) RenameWindow(session string, windowIndex int, name string) error {
 	return nil
 }
 
-func (a *App) RenameSession(session, name string) error {
+func (a *App) RenameSession(serverID, session, name string) error {
 	if strings.TrimSpace(name) == "" {
 		return errSessionNameEmpty
 	}
@@ -172,12 +253,50 @@ func (a *App) RenameSession(session, name string) error {
 		return nil
 	}
 
-	srcPath, err := a.store.SessionPath(session)
+	storage, err := a.targetStore(serverID)
+	if err != nil {
+		return fmt.Errorf("resolve session server: %w", err)
+	}
+
+	err = ensureRenameTargetFree(storage, session, name)
+	if err != nil {
+		return err
+	}
+
+	snap, err := storage.LoadSession(session)
+	if err != nil {
+		return fmt.Errorf("load session: %w", err)
+	}
+
+	snap.SessionName = name
+
+	if a.isCurrentServer(serverID) && a.tmux.SessionExists(session) {
+		err = a.tmux.RenameSession(session, name)
+		if err != nil {
+			return fmt.Errorf("rename tmux session: %w", err)
+		}
+	}
+
+	err = storage.SaveSession(snap)
+	if err != nil {
+		return fmt.Errorf("save session: %w", err)
+	}
+
+	err = storage.DeleteSession(session)
+	if err != nil {
+		return fmt.Errorf("delete old session: %w", err)
+	}
+
+	return nil
+}
+
+func ensureRenameTargetFree(storage *store.Store, session, name string) error {
+	srcPath, err := storage.SessionPath(session)
 	if err != nil {
 		return fmt.Errorf("get source session path: %w", err)
 	}
 
-	dstPath, err := a.store.SessionPath(name)
+	dstPath, err := storage.SessionPath(name)
 	if err != nil {
 		return fmt.Errorf("get dest session path: %w", err)
 	}
@@ -186,37 +305,13 @@ func (a *App) RenameSession(session, name string) error {
 		return nil
 	}
 
-	exists, err := a.store.SessionExists(name)
+	exists, err := storage.SessionExists(name)
 	if err != nil {
 		return fmt.Errorf("check session exists: %w", err)
 	}
 
 	if exists {
 		return fmt.Errorf("session %q %w", name, errAlreadyExists)
-	}
-
-	snap, err := a.store.LoadSession(session)
-	if err != nil {
-		return fmt.Errorf("load session: %w", err)
-	}
-
-	snap.SessionName = name
-
-	if a.tmux.SessionExists(session) {
-		err := a.tmux.RenameSession(session, name)
-		if err != nil {
-			return fmt.Errorf("rename tmux session: %w", err)
-		}
-	}
-
-	err = a.store.SaveSession(snap)
-	if err != nil {
-		return fmt.Errorf("save session: %w", err)
-	}
-
-	err = a.store.DeleteSession(session)
-	if err != nil {
-		return fmt.Errorf("delete old session: %w", err)
 	}
 
 	return nil
@@ -256,31 +351,31 @@ func (a *App) NewSession(name string) error {
 	return nil
 }
 
-func (a *App) NewWindow(session, name string) error {
+func (a *App) NewWindow(serverID, session, name string) error {
 	if strings.TrimSpace(session) == "" {
 		return errSessionNameEmpty
 	}
 
-	if a.tmux.SessionExists(session) {
+	storage, err := a.targetStore(serverID)
+	if err != nil {
+		return fmt.Errorf("resolve session server: %w", err)
+	}
+
+	if a.isCurrentServer(serverID) && a.tmux.SessionExists(session) {
 		err := a.tmux.NewWindow(session, name)
 		if err != nil {
 			return fmt.Errorf("create new window: %w", err)
 		}
 
-		snap, err := a.tmux.CaptureSession(session)
-		if err != nil {
-			return fmt.Errorf("capture session: %w", err)
-		}
-
-		err = a.store.SaveSession(snap)
-		if err != nil {
-			return fmt.Errorf("save session: %w", err)
+		saveErr := a.saveLiveSession(storage, session)
+		if saveErr != nil {
+			return saveErr
 		}
 
 		return nil
 	}
 
-	snap, err := a.store.LoadSession(session)
+	snap, err := storage.LoadSession(session)
 	if err != nil {
 		return fmt.Errorf("load session: %w", err)
 	}
@@ -310,7 +405,7 @@ func (a *App) NewWindow(session, name string) error {
 		},
 	})
 
-	err = a.store.SaveSession(snap)
+	err = storage.SaveSession(snap)
 	if err != nil {
 		return fmt.Errorf("save session: %w", err)
 	}
@@ -329,21 +424,35 @@ func nextWindowIndex(windows []snapshot.Window) int {
 	return maxIdx + 1
 }
 
-func (a *App) Wakeup(session string) error {
+func (a *App) Wakeup(serverID, session string) error {
 	if strings.TrimSpace(session) == "" {
 		return errSessionNameEmpty
 	}
+
+	session = strings.TrimSpace(session)
+
+	// Live state belongs to the current server only: a same-named session on
+	// another server never makes this snapshot "awake" here.
 	if a.tmux.SessionExists(session) {
 		return fmt.Errorf("session %q %w", session, errAlreadyAwake)
 	}
 
-	return a.Restore(session, false)
+	target := PickerTarget{SessionName: session, ServerID: strings.TrimSpace(serverID)}
+
+	return a.RestoreTarget(target, false)
 }
 
-func (a *App) Sleep(session string) error {
+func (a *App) Sleep(serverID, session string) error {
 	if strings.TrimSpace(session) == "" {
 		return errSessionNameEmpty
 	}
+
+	session = strings.TrimSpace(session)
+
+	if !a.isCurrentServer(serverID) {
+		return fmt.Errorf("session %q %w", session, errNotRunning)
+	}
+
 	if !a.tmux.SessionExists(session) {
 		return fmt.Errorf("session %q %w", session, errNotRunning)
 	}

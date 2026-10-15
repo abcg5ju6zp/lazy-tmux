@@ -36,32 +36,40 @@ const (
 	markFull
 )
 
-func targetKey(session string, windowIndex int) string {
-	return session + "\x00" + strconv.Itoa(windowIndex)
+const targetKeyParts = 3
+
+func targetKey(serverID, session string, windowIndex int) string {
+	return serverID + "\x00" + session + "\x00" + strconv.Itoa(windowIndex)
 }
 
-func parseTargetKey(key string) (string, int, bool) {
-	session, rest, found := strings.Cut(key, "\x00")
-	if !found {
-		return "", 0, false
+func parseTargetKey(key string) (string, string, int, bool) {
+	parts := strings.Split(key, "\x00")
+	if len(parts) != targetKeyParts {
+		return "", "", 0, false
 	}
 
-	idx, err := strconv.Atoi(rest)
+	index, err := strconv.Atoi(parts[2])
 	if err != nil {
-		return "", 0, false
+		return "", "", 0, false
 	}
 
-	return session, idx, true
+	return parts[0], parts[1], index, true
 }
 
-func (m *pickerModel) sessionWindowIndices(session string) []int {
+type sessionRef struct {
+	serverID string
+	name     string
+}
+
+func (m *pickerModel) sessionWindowIndices(serverID, session string) []int {
 	for index := range m.sessions {
-		if m.sessions[index].Record.SessionName != session {
+		sess := m.sessions[index]
+		if sess.Record.SessionName != session || sess.ServerID != serverID {
 			continue
 		}
 
-		idxs := make([]int, 0, len(m.sessions[index].Windows))
-		for _, win := range m.sessions[index].Windows {
+		idxs := make([]int, 0, len(sess.Windows))
+		for _, win := range sess.Windows {
 			idxs = append(idxs, win.Index)
 		}
 
@@ -76,11 +84,11 @@ func (m *pickerModel) markWindow(target Target) {
 		return
 	}
 
-	m.marked[targetKey(target.SessionName, *target.WindowIndex)] = struct{}{}
+	m.marked[targetKey(target.ServerID, target.SessionName, *target.WindowIndex)] = struct{}{}
 }
 
-func (m *pickerModel) markSession(session string) {
-	idxs := m.sessionWindowIndices(session)
+func (m *pickerModel) markSession(serverID, session string) {
+	idxs := m.sessionWindowIndices(serverID, session)
 	if len(idxs) == 0 {
 		return
 	}
@@ -88,7 +96,7 @@ func (m *pickerModel) markSession(session string) {
 	unmarkAll := true
 
 	for _, idx := range idxs {
-		if _, ok := m.marked[targetKey(session, idx)]; !ok {
+		if _, ok := m.marked[targetKey(serverID, session, idx)]; !ok {
 			unmarkAll = false
 
 			break
@@ -96,7 +104,7 @@ func (m *pickerModel) markSession(session string) {
 	}
 
 	for _, idx := range idxs {
-		key := targetKey(session, idx)
+		key := targetKey(serverID, session, idx)
 		if unmarkAll {
 			delete(m.marked, key)
 		} else {
@@ -111,12 +119,12 @@ func (m *pickerModel) toggleMark(row pickerRow) {
 	}
 
 	if row.target.WindowIndex == nil {
-		m.markSession(row.target.SessionName)
+		m.markSession(row.target.ServerID, row.target.SessionName)
 
 		return
 	}
 
-	key := targetKey(row.target.SessionName, *row.target.WindowIndex)
+	key := targetKey(row.target.ServerID, row.target.SessionName, *row.target.WindowIndex)
 	if _, ok := m.marked[key]; ok {
 		delete(m.marked, key)
 	} else {
@@ -126,14 +134,15 @@ func (m *pickerModel) toggleMark(row pickerRow) {
 
 func (m pickerModel) markState(row pickerRow) markState {
 	if row.target.WindowIndex != nil {
-		if _, ok := m.marked[targetKey(row.target.SessionName, *row.target.WindowIndex)]; ok {
+		key := targetKey(row.target.ServerID, row.target.SessionName, *row.target.WindowIndex)
+		if _, ok := m.marked[key]; ok {
 			return markFull
 		}
 
 		return markNone
 	}
 
-	idxs := m.sessionWindowIndices(row.target.SessionName)
+	idxs := m.sessionWindowIndices(row.target.ServerID, row.target.SessionName)
 	if len(idxs) == 0 {
 		return markNone
 	}
@@ -141,7 +150,7 @@ func (m pickerModel) markState(row pickerRow) markState {
 	marked := 0
 
 	for _, idx := range idxs {
-		if _, ok := m.marked[targetKey(row.target.SessionName, idx)]; ok {
+		if _, ok := m.marked[targetKey(row.target.ServerID, row.target.SessionName, idx)]; ok {
 			marked++
 		}
 	}
@@ -163,28 +172,34 @@ func (m *pickerModel) commitDelete() {
 		return
 	}
 
-	bySession := map[string][]int{}
+	bySession := map[sessionRef][]int{}
 
 	for key := range m.marked {
-		session, idx, ok := parseTargetKey(key)
+		serverID, session, idx, ok := parseTargetKey(key)
 		if !ok {
 			continue
 		}
 
-		bySession[session] = append(bySession[session], idx)
+		ref := sessionRef{serverID: serverID, name: session}
+		bySession[ref] = append(bySession[ref], idx)
 	}
 
-	sessions := make([]string, 0, len(bySession))
-	for session := range bySession {
-		sessions = append(sessions, session)
+	sessions := make([]sessionRef, 0, len(bySession))
+	for ref := range bySession {
+		sessions = append(sessions, ref)
 	}
+	sort.Slice(sessions, func(i, j int) bool {
+		if sessions[i].serverID != sessions[j].serverID {
+			return sessions[i].serverID < sessions[j].serverID
+		}
 
-	sort.Strings(sessions)
+		return sessions[i].name < sessions[j].name
+	})
 
 	var firstErr error
 
-	for _, session := range sessions {
-		err := m.deleteMarkedSession(session, bySession[session])
+	for _, ref := range sessions {
+		err := m.deleteMarkedSession(ref.serverID, ref.name, bySession[ref])
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -201,9 +216,9 @@ func (m *pickerModel) commitDelete() {
 	m.renderViewport()
 }
 
-func (m *pickerModel) deleteMarkedSession(session string, idxs []int) error {
-	if total := len(m.sessionWindowIndices(session)); total > 0 && len(idxs) >= total {
-		return m.deleteSession(session)
+func (m *pickerModel) deleteMarkedSession(serverID, session string, idxs []int) error {
+	if total := len(m.sessionWindowIndices(serverID, session)); total > 0 && len(idxs) >= total {
+		return m.deleteSession(serverID, session)
 	}
 
 	if m.actions.DeleteWindow == nil {
@@ -215,7 +230,7 @@ func (m *pickerModel) deleteMarkedSession(session string, idxs []int) error {
 	var firstErr error
 
 	for _, idx := range idxs {
-		err := m.actions.DeleteWindow(session, idx)
+		err := m.actions.DeleteWindow(serverID, session, idx)
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -323,12 +338,17 @@ func (m *pickerModel) commitPrompt() {
 		return
 	case modeRenameWindow:
 		if name != "" && m.pending.WindowIndex != nil {
-			err = m.renameWindow(m.pending.SessionName, *m.pending.WindowIndex, name)
+			err = m.renameWindow(
+				m.pending.ServerID,
+				m.pending.SessionName,
+				*m.pending.WindowIndex,
+				name,
+			)
 			ran = true
 		}
 	case modeRenameSession:
 		if name != "" {
-			err = m.renameSession(m.pending.SessionName, name)
+			err = m.renameSession(m.pending.ServerID, m.pending.SessionName, name)
 			ran = true
 		}
 	case modeNewSession:
@@ -337,7 +357,7 @@ func (m *pickerModel) commitPrompt() {
 			ran = true
 		}
 	case modeNewWindow:
-		err = m.createWindow(m.pending.SessionName, name)
+		err = m.createWindow(m.pending.ServerID, m.pending.SessionName, name)
 		ran = true
 	}
 
@@ -355,7 +375,7 @@ func (m *pickerModel) commitPrompt() {
 	m.renderViewport()
 }
 
-func (m *pickerModel) deleteSession(session string) error {
+func (m *pickerModel) deleteSession(serverID, session string) error {
 	if m.actions.DeleteSession == nil {
 		return errDeleteSessionUnavailable
 	}
@@ -364,23 +384,23 @@ func (m *pickerModel) deleteSession(session string) error {
 		return errSelectSessionToDelete
 	}
 
-	return m.actions.DeleteSession(session)
+	return m.actions.DeleteSession(serverID, session)
 }
 
-func (m *pickerModel) renameWindow(session string, windowIndex int, name string) error {
+func (m *pickerModel) renameWindow(serverID, session string, windowIndex int, name string) error {
 	if m.actions.RenameWindow == nil {
 		return errRenameWindowUnavailable
 	}
 
-	return m.actions.RenameWindow(session, windowIndex, name)
+	return m.actions.RenameWindow(serverID, session, windowIndex, name)
 }
 
-func (m *pickerModel) renameSession(session, name string) error {
+func (m *pickerModel) renameSession(serverID, session, name string) error {
 	if m.actions.RenameSession == nil {
 		return errRenameSessionUnavailable
 	}
 
-	return m.actions.RenameSession(session, name)
+	return m.actions.RenameSession(serverID, session, name)
 }
 
 func (m *pickerModel) createSession(name string) error {
@@ -391,7 +411,7 @@ func (m *pickerModel) createSession(name string) error {
 	return m.actions.NewSession(name)
 }
 
-func (m *pickerModel) createWindow(session, name string) error {
+func (m *pickerModel) createWindow(serverID, session, name string) error {
 	if m.actions.NewWindow == nil {
 		return errNewWindowUnavailable
 	}
@@ -400,7 +420,7 @@ func (m *pickerModel) createWindow(session, name string) error {
 		return errSelectSessionForWindow
 	}
 
-	return m.actions.NewWindow(session, name)
+	return m.actions.NewWindow(serverID, session, name)
 }
 
 func (m *pickerModel) wakeupSession() error {
@@ -413,7 +433,7 @@ func (m *pickerModel) wakeupSession() error {
 		return errWakeupUnavailable
 	}
 
-	return m.actions.Wakeup(row.target.SessionName)
+	return m.actions.Wakeup(row.target.ServerID, row.target.SessionName)
 }
 
 func (m *pickerModel) sleepSession() error {
@@ -426,7 +446,7 @@ func (m *pickerModel) sleepSession() error {
 		return errSleepUnavailable
 	}
 
-	return m.actions.Sleep(row.target.SessionName)
+	return m.actions.Sleep(row.target.ServerID, row.target.SessionName)
 }
 
 func (m *pickerModel) reload() {

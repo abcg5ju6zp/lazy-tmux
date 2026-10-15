@@ -3,17 +3,18 @@ package snapshot
 import "time"
 
 const (
-	FormatVersion         = 2
+	FormatVersion         = 3
 	AntexSessionIDMetaKey = "antex.session_id"
 )
 
 type SessionSnapshot struct {
-	Version     int       `json:"version"`
-	SessionName string    `json:"session_name"`
-	CapturedAt  time.Time `json:"captured_at,omitzero"`
-	CurrentWin  int       `json:"current_window"`
-	CurrentPane int       `json:"current_pane"`
-	Windows     []Window  `json:"windows"`
+	Version      int       `json:"version"`
+	SessionName  string    `json:"session_name"`
+	ServerSocket string    `json:"server_socket,omitempty"`
+	CapturedAt   time.Time `json:"captured_at,omitzero"`
+	CurrentWin   int       `json:"current_window"`
+	CurrentPane  int       `json:"current_pane"`
+	Windows      []Window  `json:"windows"`
 }
 
 type Window struct {
@@ -72,6 +73,7 @@ type Index struct {
 type Record struct {
 	SessionName  string    `json:"session_name"`
 	File         string    `json:"file"`
+	ServerSocket string    `json:"server_socket,omitempty"`
 	CapturedAt   time.Time `json:"captured_at,omitzero"`
 	LastAccessed time.Time `json:"last_accessed,omitzero"`
 	Windows      int       `json:"windows"`

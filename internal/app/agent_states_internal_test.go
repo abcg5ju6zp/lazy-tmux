@@ -54,10 +54,10 @@ func TestQuickPickerIncludesClaudeActivity(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if !app.sessionHasWorkingAgent(registry, "work", true) {
+	if !app.sessionHasWorkingAgent(registry, picker.QuickSession{Name: "work", Restored: true}) {
 		t.Fatal("Claude activity excluded from quick picker")
 	}
-	if app.sessionHasWorkingAgent(registry, "work", false) {
+	if app.sessionHasWorkingAgent(registry, picker.QuickSession{Name: "work", Restored: false}) {
 		t.Fatal("offline snapshot counted as working")
 	}
 }

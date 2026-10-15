@@ -2,8 +2,14 @@
 
 package picker
 
-func ChooseQuickSession([]QuickSession, string, []string, int, func() map[string]bool) (string, error) {
-	return "", errTUIDisabled
+func ChooseQuickSession(
+	[]QuickSession,
+	string,
+	[]string,
+	int,
+	func() map[string]QuickSession,
+) (QuickSession, error) {
+	return QuickSession{}, errTUIDisabled
 }
 
 func ChooseTargetWithLoader([]WindowSortKey, Actions, string) (Target, error) {

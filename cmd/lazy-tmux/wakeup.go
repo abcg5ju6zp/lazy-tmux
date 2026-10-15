@@ -8,6 +8,6 @@ import (
 
 func runWakeup(args []string, stdout, stderr io.Writer) int {
 	return runSessionOp(args, stdout, stderr, cmdWakeup, true, func(a *app.App, s string) error {
-		return a.Wakeup(s)
+		return a.Wakeup("", s)
 	})
 }
